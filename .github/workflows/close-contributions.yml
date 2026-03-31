@@ -1,50 +1,31 @@
-name: Close contributions
+name: Allow only collaborator PRs
 
 on:
-  issues:
-    types: [opened]
-  pull_request:
-    types: [opened]
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  pull-requests: write
+  issues: write
 
 jobs:
-  close:
+  gatekeep:
+    if: ${{ !contains(fromJson('["OWNER","COLLABORATOR"]'), github.event.pull_request.author_association)
+            && github.actor != 'dependabot[bot]' }}
     runs-on: ubuntu-latest
-    permissions:
-      issues: write
-      pull-requests: write
     steps:
-      - name: Close issue
-        if: github.event_name == 'issues'
+      - name: Comment and close PR
         uses: actions/github-script@v7
         with:
           script: |
+            const pr = context.payload.pull_request.number;
+            const { owner, repo } = context.repo;
+
             await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: 'This is a personal project and I\'m not accepting issues or contributions. Feel free to fork under the GPL v2.'
-            });
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              state: 'closed'
+              owner, repo, issue_number: pr,
+              body: 'This is a personal project published as-is under the GPL v2. Pull requests are not accepted from the public.\n\nFeel free to fork and continue development under the GPL.'
             });
 
-      - name: Close pull request
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.payload.pull_request.number,
-              body: 'This is a personal project and I\'m not accepting pull requests or contributions. Feel free to fork under the GPL v2.'
-            });
             await github.rest.pulls.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.payload.pull_request.number,
-              state: 'closed'
+              owner, repo, pull_number: pr, state: 'closed'
             });
