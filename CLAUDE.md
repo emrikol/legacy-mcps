@@ -71,10 +71,10 @@ All in `tools/`:
 |---|---|---|
 | `watcom/` | Open Watcom 2.0 | Cross-compiles Win16 from macOS ARM64 |
 | `dosbox-x` | DOSBox-X | Patched: ARM64 GL fix + TCP control server |
-| `dosbox-x-src/` | DOSBox-X source | GPL v2, patches in-tree + `mcp-patches.diff` |
 | `emu2` | emu2 DOS emulator | Patched for TSR support (headless testing) |
-| `emu2-src/` | emu2 source + patches | GPL v2, `mcp-patches.diff` against `dmsc/emu2@4948d1e` |
-| `win31-hdd/` | Minimal Win3.1 install | Used by DOSBox-X for `make testwin` |
+| `win31-hdd/` | Minimal Win3.1 install | Used by DOSBox-X for `make testwin` (not in repo) |
+
+Source trees and patch files are in `patches/` — see `PATCHES.md` for build instructions.
 
 ---
 
