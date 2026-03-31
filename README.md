@@ -49,13 +49,17 @@ make test       # Assembles DOSMCP.COM, runs in emu2, runs 153 tests
 
 ### Requirements
 
-- **nasm** — assembler for dos-mcp
-- **node** — test harness runtime
-- **tools/watcom/** — Open Watcom 2.0 (cross-compiles Win16 from macOS ARM64)
-- **tools/emu2** — patched DOS emulator for headless testing
-- **tools/dosbox-x** — patched DOSBox-X for GUI/Windows testing
+| Tool | Version | Purpose |
+|---|---|---|
+| [NASM](https://nasm.us/) | 2.15+ | Assembles `dosmcp.asm` |
+| [Node.js](https://nodejs.org/) | 18+ | Runs test harnesses and scripting library |
+| `tools/watcom/` | Open Watcom 2.0 | Cross-compiles Win16 C code from macOS/Linux |
+| `tools/emu2` | patched | Headless DOS emulator for `make test` |
+| `tools/dosbox-x` | patched | DOSBox-X for `make testwin` (requires display) |
 
-See [PATCHES.md](PATCHES.md) for details on the DOSBox-X and emu2 modifications.
+`tools/emu2` and `tools/dosbox-x` are patched builds — see [PATCHES.md](PATCHES.md) for how to build them from source.
+
+> **Windows 3.1 required — not included.** Running the Win16 tests requires a licensed copy of Windows 3.1 or Windows for Workgroups 3.11. The installer files cannot be redistributed here. You must supply your own copy and place it in `tools/win31-hdd/` following the setup instructions in [win-mcp/README.md](win-mcp/README.md).
 
 ## IPC Protocol
 
@@ -199,13 +203,14 @@ legacy-mcps/
 ├── ref/                   Reference documentation
 │   ├── 8086 and DOS internals (TSR, interrupts, memory)
 │   └── Keyboard scancodes, BIOS data area, etc.
-└── tools/                 Build tools (see PATCHES.md)
-    ├── dosbox-x            Patched DOSBox-X binary
-    ├── dosbox-x-src/       DOSBox-X source (GPL v2)
-    ├── emu2                Patched emu2 binary
-    ├── emu2-src/           emu2 source + mcp-patches.diff (GPL v2)
-    ├── watcom/             Open Watcom 2.0 (cross-compiler)
-    └── win31-hdd/          Minimal Windows 3.1 install for testing
+├── patches/               Patch files for vendored tools
+│   ├── emu2-mcp.diff       emu2 patches (apply to dmsc/emu2@4948d1e)
+│   └── dosbox-x-mcp.diff   DOSBox-X patches (apply to joncampbell123/dosbox-x@59915c1)
+└── tools/                 Build tools (not in repo — see PATCHES.md)
+    ├── dosbox-x            Patched DOSBox-X binary (build from source)
+    ├── emu2                Patched emu2 binary (build from source)
+    ├── watcom/             Open Watcom 2.0 (download separately)
+    └── win31-hdd/          Windows 3.1 install (not redistributable — supply your own)
 ```
 
 ## Screenshots
@@ -224,8 +229,8 @@ legacy-mcps/
 
 ## License
 
-The agent source code (dosmcp.asm, winmcp.c) is original work.
+This project is licensed under the GNU General Public License v2 or later. See [LICENSE](LICENSE).
 
-The patched tools (DOSBox-X, emu2) are GPL v2 — full source and diffs are included in `tools/`. See [PATCHES.md](PATCHES.md).
+The patched tools (DOSBox-X, emu2) are also GPL v2. Patch files are in `patches/` — see [PATCHES.md](PATCHES.md) for build instructions.
 
 Open Watcom is distributed under the Sybase Open Watcom Public License.
