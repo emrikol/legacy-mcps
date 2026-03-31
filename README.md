@@ -14,6 +14,8 @@ Two small programs that run inside vintage operating systems and expose their AP
 
 Both use the same protocol: the host writes a command to a text file, the agent reads it, executes it, and writes a response to another text file. No network stack, no sockets, no shared memory — just files. This works because the "files" live on a shared drive (SMB mount, DOSBox-X host directory mount, or emu2 drive mapping).
 
+- **[smb-share](smb-share/)** — A custom Node.js LAN Manager (LANMAN2.1) SMB server for connecting real or emulated Windows for Workgroups 3.11 machines to the host. Modern Samba won't negotiate down to the ancient dialect WFW uses — this purpose-built server does.
+
 ## Architecture
 
 ```
@@ -210,8 +212,12 @@ legacy-mcps/
 │   ├── dosbox-run.sh       DOSBox-X launcher
 │   ├── dosbox-win31.conf   Windows 3.1 boot config
 │   └── capture/            Screenshots from GDI CAPTURE
-├── share/                 Shared IPC directory
+├── share/                 Shared IPC directory (DOSBox-X / emu2)
 │   └── _MAGIC_/           Command/response files live here
+├── smb-share/             LAN Manager SMB server (for real WFW 3.11 hardware/VMs)
+│   ├── lanman-server.js   LANMAN2.1 server (sudo node lanman-server.js)
+│   ├── share/             Root of the network share (\\MACHOST\SHARE)
+│   └── docs/              MS-CIFS spec + RFC 1001/1002 reference
 ├── ref/                   Reference documentation
 │   ├── 8086 and DOS internals (TSR, interrupts, memory)
 │   └── Keyboard scancodes, BIOS data area, etc.

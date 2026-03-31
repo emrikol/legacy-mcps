@@ -1,7 +1,7 @@
 {
   "name": "smb-share",
   "version": "1.0.0",
-  "description": "",
+  "description": "Minimal LANMAN2.1 SMB server for Windows for Workgroups 3.11",
   "main": "lanman-server.js",
   "scripts": {
     "start": "node lanman-server.js",
@@ -13,7 +13,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "GPL-2.0-or-later",
   "type": "commonjs",
   "devDependencies": {
     "eslint": "^10.0.3",
