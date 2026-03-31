@@ -168,7 +168,13 @@ await notepad.capture();
 await notepad.close();
 ```
 
-See [SCRIPTING.md](SCRIPTING.md) for the full API reference and [examples/minesweeper.js](examples/minesweeper.js) for a complete demo.
+See [SCRIPTING.md](SCRIPTING.md) for the full API reference.
+
+**Examples:**
+
+- [examples/notepad.js](examples/notepad.js) — open Notepad, type text, read clipboard, capture screenshot
+- [examples/minesweeper.js](examples/minesweeper.js) — launch Minesweeper, click corners, take screenshots
+- [examples/dos-sysinfo.js](examples/dos-sysinfo.js) — query DOS MCP directly (version, memory, TSR list)
 
 ## Project structure
 
@@ -182,7 +188,9 @@ legacy-mcps/
 │   ├── win-auto.js        Node.js scripting library (Playwright-style)
 │   └── win-compare.js     BMP screenshot comparison utility
 ├── examples/
-│   └── minesweeper.js     Demo: automate Minesweeper
+│   ├── notepad.js         Demo: type text, read clipboard, screenshot
+│   ├── minesweeper.js     Demo: automate Minesweeper (Win16)
+│   └── dos-sysinfo.js     Demo: query DOS MCP for system info
 ├── dos-mcp/               DOS TSR agent
 │   ├── src/dosmcp.asm     Source (8086 NASM assembly)
 │   ├── Makefile            Build + test targets
