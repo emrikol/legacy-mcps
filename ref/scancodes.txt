@@ -1,0 +1,94 @@
+; PC/AT Keyboard Scan Codes — Reference for KEYDOWN/KEYUP commands
+;
+; Usage:  KEYDOWN <name>     (modifier keys — sets shift flag at 0040:0017)
+;         KEYDOWN 0x<hex>    (any key — stuffs keyboard buffer)
+;         KEYUP <name>       (modifier keys — clears shift flag)
+;         KEYUP 0x<hex>      (regular keys — no-op, returns OK)
+;
+; Scan  Key             Notes
+; ----  --------------- ----------------------------------------
+0x01    ESC
+0x02    1               ! with Shift
+0x03    2               @ with Shift
+0x04    3               # with Shift
+0x05    4               $ with Shift
+0x06    5               % with Shift
+0x07    6               ^ with Shift
+0x08    7               & with Shift
+0x09    8               * with Shift
+0x0A    9               ( with Shift
+0x0B    0               ) with Shift
+0x0C    MINUS           - (hyphen)
+0x0D    EQUALS          =
+0x0E    BACKSPACE
+0x0F    TAB
+0x10    Q
+0x11    W
+0x12    E
+0x13    R
+0x14    T
+0x15    Y
+0x16    U
+0x17    I
+0x18    O
+0x19    P
+0x1A    LBRACKET        [
+0x1B    RBRACKET        ]
+0x1C    ENTER
+0x1D    CTRL            Modifier — KEYDOWN sets bit 2 of 0040:0017
+0x1E    A
+0x1F    S
+0x20    D
+0x21    F
+0x22    G
+0x23    H
+0x24    J
+0x25    K
+0x26    L
+0x27    SEMICOLON       ;
+0x28    QUOTE           '
+0x29    BACKQUOTE       `
+0x2A    LSHIFT          Modifier — KEYDOWN sets bit 1 of 0040:0017
+0x2B    BACKSLASH       \
+0x2C    Z
+0x2D    X
+0x2E    C
+0x2F    V
+0x30    B
+0x31    N
+0x32    M
+0x33    COMMA           ,
+0x34    PERIOD          .
+0x35    SLASH           /
+0x36    RSHIFT          Modifier — KEYDOWN sets bit 0 of 0040:0017
+0x37    KP_MULTIPLY     Keypad *
+0x38    ALT             Modifier — KEYDOWN sets bit 3 of 0040:0017
+0x39    SPACE
+0x3A    CAPSLOCK        Toggle — KEYDOWN sets bit 6 of 0040:0017
+0x3B    F1
+0x3C    F2
+0x3D    F3
+0x3E    F4
+0x3F    F5
+0x40    F6
+0x41    F7
+0x42    F8
+0x43    F9
+0x44    F10
+0x45    NUMLOCK         Toggle — KEYDOWN sets bit 5 of 0040:0017
+0x46    SCROLLLOCK      Toggle — KEYDOWN sets bit 4 of 0040:0017
+0x47    HOME            Keypad 7/Home
+0x48    UP              Keypad 8/Up
+0x49    PGUP            Keypad 9/PgUp
+0x4A    KP_MINUS        Keypad -
+0x4B    LEFT            Keypad 4/Left
+0x4C    KP_5            Keypad 5
+0x4D    RIGHT           Keypad 6/Right
+0x4E    KP_PLUS         Keypad +
+0x4F    END             Keypad 1/End
+0x50    DOWN            Keypad 2/Down
+0x51    PGDN            Keypad 3/PgDn
+0x52    INSERT          Toggle — KEYDOWN sets bit 7 of 0040:0017
+0x53    DELETE          Keypad ./Del
+0x57    F11
+0x58    F12

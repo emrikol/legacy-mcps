@@ -1,0 +1,427 @@
+diff --git a/src/gui/Makefile.am b/src/gui/Makefile.am
+index 4e16f71..730c77c 100644
+--- a/src/gui/Makefile.am
++++ b/src/gui/Makefile.am
+@@ -10,7 +10,8 @@ libgui_a_SOURCES = \
+ 	render_templates_hq2x.h render_templates_hq3x.h \
+ 	midi.cpp midi_win32.h midi_oss.h midi_coreaudio.h \
+ 	midi_alsa.h midi_coremidi.h sdl_gui.cpp dosbox_splash.h \
+-	menu.cpp menu_callback.cpp bitop.cpp ptrop.cpp zipcrc.c zipfile.cpp
++	menu.cpp menu_callback.cpp bitop.cpp ptrop.cpp zipcrc.c zipfile.cpp \
++	dosbox_control_server.cpp
+ 
+ if C_MT32
+ AM_CPPFLAGS += -I$(top_srcdir)/src/libs/mt32
+diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
+index 77f4f32..c919c87 100644
+--- a/src/gui/sdlmain.cpp
++++ b/src/gui/sdlmain.cpp
+@@ -4128,7 +4128,7 @@ static void GUI_StartUp() {
+     {
+ #if C_DIRECT3D
+         if(!init_output) OUTPUT_DIRECT3D_Select();
+-#elif C_OPENGL && defined(MACOSX) // JC: This is breaking SDL1 on Linux! Limit this to MAC OS! Windows users may use this if needed.
++#elif C_OPENGL && defined(MACOSX) && !defined(__arm64__) // JC: This is breaking SDL1 on Linux! Limit this to MAC OS! Windows users may use this if needed.
+         if(!init_output) OUTPUT_OPENGL_Select(GLBilinear); // Initialize screen before switching to TTF (required for macOS builds)
+ #endif
+         OUTPUT_SURFACE_Select();
+@@ -8459,6 +8459,15 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
+     bitop::self_test();
+     ptrop::self_test();
+ 
++    // Initialize control server for external automation
++    {
++        extern void ControlServer_Init(int port);
++        extern void ControlServer_Shutdown();
++        const char *port_env = getenv("DOSBOX_CONTROL_PORT");
++        int port = port_env ? atoi(port_env) : 0;
++        if (port > 0) ControlServer_Init(port);
++    }
++
+     // initialize output libraries
+     OUTPUT_SURFACE_Initialize();
+ #if C_OPENGL
+diff --git a/src/hardware/hardware.cpp b/src/hardware/hardware.cpp
+index 5c2037d..441c795 100644
+--- a/src/hardware/hardware.cpp
++++ b/src/hardware/hardware.cpp
+@@ -970,6 +970,13 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
+ 		fclose(fp);
+ 		if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
+ 
++		/* Notify control server if it requested this screenshot */
++		{
++			extern bool ControlServer_ScreenshotRequested();
++			extern void ControlServer_ScreenshotComplete();
++			if (ControlServer_ScreenshotRequested())
++				ControlServer_ScreenshotComplete();
++		}
+ 	}
+ 	pathscr = "";
+ skip_shot:
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+new file mode 100644
+index 0000000..526153d
+--- /dev/null
++++ b/src/gui/dosbox_control_server.cpp
+@@ -0,0 +1,360 @@
++/*
++ * DOSBox-X Control Server
++ *
++ * Simple TCP server on localhost for external control of DOSBox-X.
++ * Accepts text commands, returns text responses. One connection at a time.
++ *
++ * Commands:
++ *   SCREENSHOT [path]  - Capture screen to PNG, respond with path
++ *   SCREEN             - Read VGA text buffer (80x25), returns lines separated by \n
++ *   STATUS             - Return emulator status
++ *   QUIT               - Shut down DOSBox-X
++ *   PING               - Liveness check, returns PONG
++ *
++ * Config: [sdl] section, "control_port" setting (0 = disabled, default 10199)
++ */
++
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <atomic>
++
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <netinet/in.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++
++#include "logging.h"
++#include "hardware.h"
++#include "mem.h"
++#include "vga.h"
++#include "keyboard.h"
++#include "bios.h"
++
++/* Externs */
++extern Bitu CaptureState;
++extern std::string capturedir;
++extern const char* RunningProgram;
++extern bool BIOS_AddKeyToBuffer(uint16_t code);
++/* Shutdown is handled by killing the process externally */
++
++/* State */
++static std::atomic<bool> control_server_running(false);
++static std::thread control_server_thread;
++static int server_fd = -1;
++static int control_port = 0;
++
++/* Path where the next screenshot should be saved (empty = default) */
++static std::string screenshot_path;
++static std::atomic<bool> screenshot_requested(false);
++static std::atomic<bool> screenshot_done(false);
++
++/* Public interface for hardware.cpp to check */
++bool ControlServer_ScreenshotRequested() {
++    return screenshot_requested.load();
++}
++
++const std::string& ControlServer_GetScreenshotPath() {
++    return screenshot_path;
++}
++
++void ControlServer_ScreenshotComplete() {
++    screenshot_done.store(true);
++    screenshot_requested.store(false);
++}
++
++static std::string handle_command(const std::string& cmd) {
++    /* Trim trailing whitespace */
++    std::string c = cmd;
++    while (!c.empty() && (c.back() == '\r' || c.back() == '\n' || c.back() == ' '))
++        c.pop_back();
++
++    if (c == "PING") {
++        return "OK PONG\n";
++    }
++
++    if (c == "STATUS") {
++        char buf[256];
++        snprintf(buf, sizeof(buf), "OK PROGRAM=%s CAPTURE_DIR=%s\n",
++                 RunningProgram ? RunningProgram : "NONE",
++                 capturedir.c_str());
++        return std::string(buf);
++    }
++
++    if (c.substr(0, 10) == "SCREENSHOT") {
++        /* Optional path argument */
++        if (c.length() > 11) {
++            screenshot_path = c.substr(11);
++        } else {
++            screenshot_path = "";
++        }
++        screenshot_done.store(false);
++        screenshot_requested.store(true);
++        CaptureState |= CAPTURE_IMAGE;
++
++        /* Wait for screenshot to complete (max 5 seconds) */
++        for (int i = 0; i < 50 && !screenshot_done.load(); i++) {
++            usleep(100000); /* 100ms */
++        }
++
++        if (screenshot_done.load()) {
++            return "OK SCREENSHOT\n";
++        } else {
++            return "ERR TIMEOUT\n";
++        }
++    }
++
++    if (c == "SCREEN") {
++        /*
++         * Read VGA text buffer at B800:0000.
++         * Each cell is 2 bytes: char (even) + attribute (odd).
++         * Standard text mode is 80 columns x 25 rows.
++         * Returns each row as a line, trailing spaces stripped.
++         * In graphics mode, returns ERR GRAPHICS_MODE.
++         */
++        if (vga.mode != M_TEXT && vga.mode != M_HERC_TEXT && vga.mode != M_TANDY_TEXT) {
++            return "ERR GRAPHICS_MODE\n";
++        }
++
++        /* Read dimensions from BIOS data area */
++        int cols = real_readb(0x40, 0x4A); /* columns per row */
++        int rows = real_readb(0x40, 0x84); /* rows - 1 (EGA+) */
++        if (cols == 0) cols = 80;
++        if (rows == 0) rows = 24; else rows += 1;
++        if (cols > 132) cols = 132;
++        if (rows > 60) rows = 60;
++
++        std::string result;
++        for (int row = 0; row < rows; row++) {
++            char line[256];
++            int last_nonspace = -1;
++            for (int col = 0; col < cols && col < 255; col++) {
++                /* B800:0000 + (row * cols + col) * 2 */
++                uint16_t off = (uint16_t)((row * cols + col) * 2);
++                uint8_t ch = real_readb(0xB800, off);
++                if (ch < 32 || ch == 127) ch = ' ';
++                line[col] = (char)ch;
++                if (ch != ' ') last_nonspace = col;
++            }
++            line[last_nonspace + 1] = '\0';
++            result += line;
++            result += '\n';
++        }
++        return result;
++    }
++
++    if (c.substr(0, 4) == "TYPE" && c.length() > 5) {
++        /*
++         * TYPE <text> — simulate keyboard input via KEYBOARD_AddKey.
++         * Works in both DOS text mode and Windows GUI mode.
++         * Escape sequences: \n = Enter, \t = Tab, \e = Escape, \\ = backslash
++         * Small delay between keypresses for reliability.
++         */
++        static const struct { char ch; KBD_KEYS key; bool shift; } keymap[] = {
++            {'a',KBD_a,false},{'b',KBD_b,false},{'c',KBD_c,false},{'d',KBD_d,false},
++            {'e',KBD_e,false},{'f',KBD_f,false},{'g',KBD_g,false},{'h',KBD_h,false},
++            {'i',KBD_i,false},{'j',KBD_j,false},{'k',KBD_k,false},{'l',KBD_l,false},
++            {'m',KBD_m,false},{'n',KBD_n,false},{'o',KBD_o,false},{'p',KBD_p,false},
++            {'q',KBD_q,false},{'r',KBD_r,false},{'s',KBD_s,false},{'t',KBD_t,false},
++            {'u',KBD_u,false},{'v',KBD_v,false},{'w',KBD_w,false},{'x',KBD_x,false},
++            {'y',KBD_y,false},{'z',KBD_z,false},
++            {'A',KBD_a,true},{'B',KBD_b,true},{'C',KBD_c,true},{'D',KBD_d,true},
++            {'E',KBD_e,true},{'F',KBD_f,true},{'G',KBD_g,true},{'H',KBD_h,true},
++            {'I',KBD_i,true},{'J',KBD_j,true},{'K',KBD_k,true},{'L',KBD_l,true},
++            {'M',KBD_m,true},{'N',KBD_n,true},{'O',KBD_o,true},{'P',KBD_p,true},
++            {'Q',KBD_q,true},{'R',KBD_r,true},{'S',KBD_s,true},{'T',KBD_t,true},
++            {'U',KBD_u,true},{'V',KBD_v,true},{'W',KBD_w,true},{'X',KBD_x,true},
++            {'Y',KBD_y,true},{'Z',KBD_z,true},
++            {'1',KBD_1,false},{'2',KBD_2,false},{'3',KBD_3,false},{'4',KBD_4,false},
++            {'5',KBD_5,false},{'6',KBD_6,false},{'7',KBD_7,false},{'8',KBD_8,false},
++            {'9',KBD_9,false},{'0',KBD_0,false},
++            {'!',KBD_1,true},{'@',KBD_2,true},{'#',KBD_3,true},{'$',KBD_4,true},
++            {'%',KBD_5,true},{'^',KBD_6,true},{'&',KBD_7,true},{'*',KBD_8,true},
++            {'(',KBD_9,true},{')',KBD_0,true},
++            {' ',KBD_space,false},{'-',KBD_minus,false},{'=',KBD_equals,false},
++            {'[',KBD_leftbracket,false},{']',KBD_rightbracket,false},
++            {';',KBD_semicolon,false},{'\'',KBD_quote,false},
++            {',',KBD_comma,false},{'.',KBD_period,false},{'/',KBD_slash,false},
++            {'`',KBD_grave,false},{'\\',KBD_backslash,false},
++            {'_',KBD_minus,true},{'+',KBD_equals,true},
++            {'{',KBD_leftbracket,true},{'}',KBD_rightbracket,true},
++            {':',KBD_semicolon,true},{'"',KBD_quote,true},
++            {'<',KBD_comma,true},{'>',KBD_period,true},{'?',KBD_slash,true},
++            {'~',KBD_grave,true},{'|',KBD_backslash,true},
++            {0,KBD_NONE,false} /* sentinel */
++        };
++
++        std::string text = c.substr(5);
++        for (size_t i = 0; i < text.length(); i++) {
++            char ch = text[i];
++            /* Handle escape sequences */
++            if (ch == '\\' && i + 1 < text.length()) {
++                char next = text[i + 1];
++                if (next == 'n') { KEYBOARD_AddKey(KBD_enter, true); usleep(20000); KEYBOARD_AddKey(KBD_enter, false); usleep(30000); i++; continue; }
++                if (next == 't') { KEYBOARD_AddKey(KBD_tab, true); usleep(20000); KEYBOARD_AddKey(KBD_tab, false); usleep(30000); i++; continue; }
++                if (next == 'e') { KEYBOARD_AddKey(KBD_esc, true); usleep(20000); KEYBOARD_AddKey(KBD_esc, false); usleep(30000); i++; continue; }
++                if (next == '\\') { ch = '\\'; i++; } /* fall through to keymap lookup */
++            }
++            /* Look up in keymap */
++            for (int k = 0; keymap[k].ch != 0; k++) {
++                if (keymap[k].ch == ch) {
++                    if (keymap[k].shift) KEYBOARD_AddKey(KBD_leftshift, true);
++                    KEYBOARD_AddKey(keymap[k].key, true);
++                    usleep(20000);
++                    KEYBOARD_AddKey(keymap[k].key, false);
++                    if (keymap[k].shift) KEYBOARD_AddKey(KBD_leftshift, false);
++                    usleep(30000);
++                    break;
++                }
++            }
++        }
++        return "OK\n";
++    }
++
++    if (c.substr(0, 3) == "KEY" && c.length() > 4) {
++        /*
++         * KEY <name> — press and release a special key.
++         * Names: ENTER, ESC, TAB, SPACE, UP, DOWN, LEFT, RIGHT,
++         *        F1-F12, BACKSPACE, DELETE, HOME, END, PGUP, PGDN,
++         *        Y, N (single chars for quick yes/no)
++         */
++        std::string key = c.substr(4);
++        KBD_KEYS k = KBD_NONE;
++        if (key == "ENTER") k = KBD_enter;
++        else if (key == "ESC") k = KBD_esc;
++        else if (key == "TAB") k = KBD_tab;
++        else if (key == "SPACE") k = KBD_space;
++        else if (key == "BACKSPACE") k = KBD_backspace;
++        else if (key == "DELETE") k = KBD_delete;
++        else if (key == "UP") k = KBD_up;
++        else if (key == "DOWN") k = KBD_down;
++        else if (key == "LEFT") k = KBD_left;
++        else if (key == "RIGHT") k = KBD_right;
++        else if (key == "HOME") k = KBD_home;
++        else if (key == "END") k = KBD_end;
++        else if (key == "PGUP") k = KBD_pageup;
++        else if (key == "PGDN") k = KBD_pagedown;
++        else if (key == "F1") k = KBD_f1;
++        else if (key == "F2") k = KBD_f2;
++        else if (key == "F3") k = KBD_f3;
++        else if (key == "F4") k = KBD_f4;
++        else if (key == "F5") k = KBD_f5;
++        else if (key == "F6") k = KBD_f6;
++        else if (key == "F7") k = KBD_f7;
++        else if (key == "F8") k = KBD_f8;
++        else if (key == "F9") k = KBD_f9;
++        else if (key == "F10") k = KBD_f10;
++        else if (key == "F11") k = KBD_f11;
++        else if (key == "F12") k = KBD_f12;
++        else if (key == "INSERT") k = KBD_insert;
++        else if (key.length() == 1 && key[0] >= 'A' && key[0] <= 'Z') {
++            /* Single letter — add to BIOS buffer */
++            BIOS_AddKeyToBuffer((uint16_t)(unsigned char)key[0]);
++            return "OK\n";
++        }
++        else return "ERR UNKNOWN_KEY\n";
++
++        KEYBOARD_AddKey(k, true);
++        usleep(20000); /* 20ms between press and release */
++        KEYBOARD_AddKey(k, false);
++        return "OK\n";
++    }
++
++    if (c == "QUIT") {
++        /* Signal clean exit — caller should also kill process */
++        _exit(0);
++        return "OK\n"; /* unreachable */
++    }
++
++    return "ERR UNKNOWN_COMMAND\n";
++}
++
++static void server_loop() {
++    LOG_MSG("Control server: listening on port %d", control_port);
++
++    while (control_server_running.load()) {
++        /* Accept with timeout using select */
++        fd_set readfds;
++        FD_ZERO(&readfds);
++        FD_SET(server_fd, &readfds);
++        struct timeval tv = { 1, 0 }; /* 1 second timeout */
++
++        int sel = select(server_fd + 1, &readfds, nullptr, nullptr, &tv);
++        if (sel <= 0) continue;
++
++        struct sockaddr_in client_addr;
++        socklen_t addr_len = sizeof(client_addr);
++        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
++        if (client_fd < 0) continue;
++
++        /* Read command (one line per connection) */
++        char buf[1024];
++        ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
++        if (n > 0) {
++            buf[n] = '\0';
++            std::string response = handle_command(std::string(buf));
++            write(client_fd, response.c_str(), response.length());
++        }
++
++        close(client_fd);
++    }
++
++    close(server_fd);
++    server_fd = -1;
++    LOG_MSG("Control server: stopped");
++}
++
++void ControlServer_Init(int port) {
++    if (port <= 0) return;
++    control_port = port;
++
++    server_fd = socket(AF_INET, SOCK_STREAM, 0);
++    if (server_fd < 0) {
++        LOG_MSG("Control server: failed to create socket");
++        return;
++    }
++
++    int opt = 1;
++    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
++
++    struct sockaddr_in addr;
++    memset(&addr, 0, sizeof(addr));
++    addr.sin_family = AF_INET;
++    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); /* 127.0.0.1 only */
++    addr.sin_port = htons(port);
++
++    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
++        LOG_MSG("Control server: failed to bind port %d: %s", port, strerror(errno));
++        close(server_fd);
++        server_fd = -1;
++        return;
++    }
++
++    if (listen(server_fd, 1) < 0) {
++        LOG_MSG("Control server: failed to listen: %s", strerror(errno));
++        close(server_fd);
++        server_fd = -1;
++        return;
++    }
++
++    control_server_running.store(true);
++    control_server_thread = std::thread(server_loop);
++    control_server_thread.detach();
++
++    LOG_MSG("Control server: initialized on port %d", port);
++}
++
++void ControlServer_Shutdown() {
++    if (!control_server_running.load()) return;
++    control_server_running.store(false);
++
++    /* Close server socket to unblock accept() */
++    if (server_fd >= 0) {
++        close(server_fd);
++        server_fd = -1;
++    }
++}

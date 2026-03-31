@@ -1,0 +1,20 @@
+NAME        WINMCHK
+DESCRIPTION 'WIN-MCP Hook DLL — Journal Record/Playback'
+EXETYPE     WINDOWS
+LIBRARY
+CODE        PRELOAD MOVEABLE DISCARDABLE
+DATA        PRELOAD MOVEABLE SINGLE
+HEAPSIZE    1024
+EXPORTS
+    JournalRecordProc   @1
+    JournalPlaybackProc @2
+    StartRecord         @3
+    StopRecord          @4
+    StartPlayback       @5
+    StopPlayback        @6
+    GetRecordCount      @7
+    GetPlaybackState    @8
+    SetPlaybackSpeed    @9
+    GetEventBuffer      @10
+    SetEventBuffer      @11
+    GetBufferCapacity   @12

@@ -1,0 +1,44 @@
+# Build artifacts (intermediate files only — compiled binaries in share/ are intentional)
+*.obj
+*.map
+*.err
+*.lst
+*.pid
+dos-mcp/src/*.COM
+win-mcp/src/*.EXE
+win-mcp/src/*.DLL
+
+# Test artifacts
+dos-mcp/src/tstdir/
+
+# Windows 3.1 install (not distributable)
+tools/win31-hdd/
+tools/win31-staging/
+
+# Large binary tools (build from source or download)
+tools/dosbox-x
+tools/dosbox-x-patched
+tools/emu2
+tools/watcom/
+tools/open-watcom-*
+tools/ow-snapshot.*
+tools/pg64v21t.zip
+
+# Vendored GPL source trees (clone + patch from patches/ — see PATCHES.md)
+tools/dosbox-x-src/
+tools/emu2-src/
+
+# Microsoft Windows 3.1 files (not redistributable — supply your own)
+share/SUPERVGA.DR_
+share/VGAFIX.FO_
+share/VGAOEM.FO_
+share/VGASYS.FO_
+
+# IPC temp files
+share/_MAGIC_/
+
+# OS files
+.DS_Store
+
+# Node
+node_modules/

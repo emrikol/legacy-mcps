@@ -1,0 +1,412 @@
+diff --git a/src/cpu.c b/src/cpu.c
+index 8eef9a0..d037784 100644
+--- a/src/cpu.c
++++ b/src/cpu.c
+@@ -2264,10 +2264,13 @@ static void i_leave(void)
+     wregs[BP] = PopWord();
+ }
+ 
+-NORETURN static void i_halt(void)
++static void i_halt(void)
+ {
+-    printf("HALT instruction!\n");
+-    exit(0);
++    // HLT: halt until next interrupt (used by TSR idle loops)
++    // Instead of exiting, set exit_cpu flag so the main loop calls
++    // emulator_update() which triggers timer IRQ to wake us up.
++    // The JMP back to HLT in the caller's code will re-enter here.
++    exit_cpu = 1;
+ }
+ 
+ static void debug_instruction(void)
+@@ -2535,7 +2538,7 @@ static void do_instruction(uint8_t code)
+     case 0xf1: i_undefined();                                  break;
+     case 0xf2: rep(0);                                         break;
+     case 0xf3: rep(1);                                         break;
+-    case 0xf4: i_halt();
++    case 0xf4: i_halt();                                       break;
+     case 0xf5: CF = !CF;                                       break;
+     case 0xf6: i_f6pre();                                      break;
+     case 0xf7: i_f7pre();                                      break;
+@@ -2646,3 +2649,8 @@ void cpuTriggerIRQ(int num)
+ {
+     irq_mask |= (1 << num);
+ }
++
++void cpuTriggerInt(int int_num)
++{
++    interrupt(int_num);
++}
+diff --git a/src/dos.c b/src/dos.c
+index 4702595..1bbadbd 100644
+--- a/src/dos.c
++++ b/src/dos.c
+@@ -32,6 +32,10 @@ static uint8_t *nls_country_info;
+ static uint32_t dos_sysvars;
+ static uint32_t dos_append;
+ 
++// InDOS flag and Critical Error flag (2 bytes: [CritErr][InDOS])
++// Address of InDOS flag returned by INT 21h/34h
++static uint32_t dos_indos_addr;
++
+ // Last error - used to implement "get extended error"
+ static uint8_t dos_error;
+ 
+@@ -200,7 +204,8 @@ static int dos_open_file(int create, int access_mode, int name_addr)
+     if(create)
+     {
+         // Use exclusive access on create == 2, to fail on existing file
+-        mflag = O_CREAT | O_RDWR | (create == 2 ? O_EXCL : 0);
++        // O_TRUNC needed for create == 1 (DOS INT 21h/3Ch truncates existing files)
++        mflag = O_CREAT | O_RDWR | (create == 2 ? O_EXCL : O_TRUNC);
+         mode = "w+b";
+     }
+     else
+@@ -1216,6 +1221,10 @@ void intr21(void)
+     if(debug_active(debug_dos))
+         intr21_debug();
+ 
++    // Increment InDOS flag on INT 21h entry
++    if(dos_indos_addr)
++        memory[dos_indos_addr + 1]++;
++
+     // Process interrupt
+     unsigned ax = cpuGetAX(), ah = ax >> 8;
+ 
+@@ -1650,12 +1659,76 @@ void intr21(void)
+         cpuSetAX(dosver);
+         cpuSetBX(0x0000);
+         break;
++    case 0x31: // KEEP PROCESS (TSR)
++    {
++        uint16_t keep_paras = cpuGetDX();
++        return_code = ax & 0xFF;
++        uint16_t psp = get_current_PSP();
++        debug(debug_dos, "\tTSR: PSP=%04X, keep %04X paragraphs, rc=%d\n",
++              psp, keep_paras, return_code);
++
++        // Resize the PSP's memory block to keep only the resident portion
++        if(keep_paras > 0)
++            mem_resize_segment(psp, keep_paras);
++
++        // Check if this is the top-level process (parent PSP == 0xFFFE)
++        if(0xFFFE == get16(cpuGetAddress(psp, 22)))
++        {
++            // No parent — enter idle loop: HLT + JMP $-1
++            // Write a tiny stub: F4 EB FD (HLT; JMP $-1)
++            // Place it at a safe location in high memory
++            uint32_t stub = 0xFE100;
++            memory[stub] = 0xF4;     // HLT
++            memory[stub + 1] = 0xEB; // JMP short
++            memory[stub + 2] = 0xFD; // -3 (back to HLT)
++            // Modify the IRET return address on stack to point to our HLT stub.
++            // The INT 21h was invoked via interrupt(), which pushed FLAGS/CS/IP.
++            // The stack was saved at entry: PSP offset 0x2E=SP, 0x30=SS.
++            // We need to modify the IRET frame that bios_routine's simulated
++            // IRET (do_instruction(0xCF)) will pop.
++            // The IRET frame is at current SS:SP (pushed by interrupt()).
++            int stack = cpuGetAddress(cpuGetSS(), cpuGetSP());
++            put16(stack + 0, stub & 0xF);       // IP = stub offset
++            put16(stack + 2, stub >> 4);         // CS = stub segment
++            put16(stack + 4, 0x0202);            // FLAGS with IF=1
++        }
++        else
++        {
++            // Has parent — return to parent like EXIT but keep memory
++            // Restore INT 22h, 23h, 24h from PSP
++            put16(0x88, get16(cpuGetAddress(psp, 10)));
++            put16(0x8A, get16(cpuGetAddress(psp, 12)));
++            put16(0x8C, get16(cpuGetAddress(psp, 14)));
++            put16(0x8E, get16(cpuGetAddress(psp, 16)));
++            put16(0x90, get16(cpuGetAddress(psp, 18)));
++            put16(0x92, get16(cpuGetAddress(psp, 20)));
++            // Set PSP to parent
++            set_current_PSP(get16(cpuGetAddress(psp, 22)));
++            // Get parent's saved stack
++            cpuSetSS(get16(cpuGetAddress(get_current_PSP(), 0x30)));
++            cpuSetSP(get16(cpuGetAddress(get_current_PSP(), 0x2E)));
++            int stack = cpuGetAddress(cpuGetSS(), cpuGetSP());
++            // Fixup interrupt return to INT 22h handler
++            put16(stack, get16(0x22 * 4));
++            put16(stack + 2, get16(0x22 * 4 + 2));
++            put16(stack + 4, 0xf202);
++        }
++        break;
++    }
+     case 0x33: // BREAK SETTINGS
+         if(ax == 0x3300)
+             cpuSetDX((cpuGetDX() & 0xFF00) | 1);
+         else if(ax == 0x3301)
+             cpuSetDX((cpuGetDX() & 0xFF00) | 1); // Ignore new state
+         break;
++    case 0x34: // GET INDOS FLAG ADDRESS
++        // Returns ES:BX pointing to the InDOS flag byte
++        // Critical Error flag is at ES:BX-1 (DOS 3.1+ convention)
++        cpuSetES((dos_indos_addr + 1) >> 4);
++        cpuSetBX((dos_indos_addr + 1) & 0xF);
++        debug(debug_dos, "\tInDOS flag at %04X:%04X\n",
++              cpuGetES(), cpuGetBX());
++        break;
+     case 0x35: // get interrupt vector
+         cpuSetBX(get16(4 * (ax & 0xFF)));
+         cpuSetES(get16(4 * (ax & 0xFF) + 2));
+@@ -1794,6 +1867,7 @@ void intr21(void)
+         else
+         {
+             unsigned n = fwrite(buf, 1, len, f);
++            fflush(f); // Flush to disk immediately for file-based IPC
+             cpuSetAX(n);
+         }
+         dos_error = 0;
+@@ -2393,6 +2467,10 @@ void intr21(void)
+         cpuSetFlag(cpuFlag_CF);
+         cpuSetAX(ax & 0xFF00);
+     }
++
++    // Decrement InDOS flag on INT 21h exit
++    if(dos_indos_addr && memory[dos_indos_addr + 1] > 0)
++        memory[dos_indos_addr + 1]--;
+ }
+ 
+ // DOS int 22 - TERMINATE ADDRESS
+@@ -2590,6 +2668,11 @@ void init_dos(int argc, char **argv)
+     // Init SYSVARS
+     dos_sysvars = get_static_memory(128, 0);
+     put16(dos_sysvars + 22, 0x0080); // First MCB
++
++    // Allocate InDOS flag and Critical Error flag (2 bytes: [CritErr][InDOS])
++    dos_indos_addr = get_static_memory(2, 0);
++    memory[dos_indos_addr] = 0;     // Critical Error flag
++    memory[dos_indos_addr + 1] = 0; // InDOS flag
+     // NUL driver
+     static const uint8_t null_device[] = {
+         0xff, 0xff, 0x00, 0x00,                    // Next driver
+@@ -2697,7 +2780,13 @@ void init_dos(int argc, char **argv)
+ 
+ void intr28(void)
+ {
+-    usleep(1); // TODO: process messages?
++    // DOS idle interrupt — decrement InDOS flag temporarily so TSRs
++    // can safely call DOS functions during idle
++    if(dos_indos_addr && memory[dos_indos_addr + 1] > 0)
++        memory[dos_indos_addr + 1]--;
++    usleep(1);
++    if(dos_indos_addr)
++        memory[dos_indos_addr + 1]++;
+ }
+ 
+ void intr29(void)
+@@ -2708,3 +2797,76 @@ void intr29(void)
+     debug(debug_dos, "D-29:   fast console out  AX=%04X\n", ax);
+     dos_putchar(ax & 0xFF, 1);
+ }
++
++// INT 33h — Mouse driver (puppet mode for MCP automation)
++static int mouse_x = 0, mouse_y = 0;
++static int mouse_buttons = 0;    // Bit 0=left, bit 1=right
++static int mouse_visible = 0;
++static int mouse_x_min = 0, mouse_x_max = 639;
++static int mouse_y_min = 0, mouse_y_max = 199;
++static int mouse_mickey_x = 0, mouse_mickey_y = 0;
++
++void intr33(void)
++{
++    unsigned ax = cpuGetAX();
++    debug(debug_int, "D-33: AX=%04X\n", ax);
++    switch(ax)
++    {
++    case 0x0000: // Reset / Initialize
++        mouse_x = 0;
++        mouse_y = 0;
++        mouse_buttons = 0;
++        mouse_visible = 0;
++        mouse_x_min = 0;
++        mouse_x_max = 639;
++        mouse_y_min = 0;
++        mouse_y_max = 199;
++        mouse_mickey_x = 0;
++        mouse_mickey_y = 0;
++        cpuSetAX(0xFFFF);  // Mouse installed
++        cpuSetBX(2);       // 2 buttons
++        break;
++    case 0x0001: // Show cursor
++        mouse_visible = 1;
++        break;
++    case 0x0002: // Hide cursor
++        mouse_visible = 0;
++        break;
++    case 0x0003: // Get position & buttons
++        cpuSetBX(mouse_buttons);
++        cpuSetCX(mouse_x);
++        cpuSetDX(mouse_y);
++        break;
++    case 0x0004: // Set position
++        mouse_x = cpuGetCX();
++        mouse_y = cpuGetDX();
++        // Clamp to range
++        if(mouse_x < mouse_x_min) mouse_x = mouse_x_min;
++        if(mouse_x > mouse_x_max) mouse_x = mouse_x_max;
++        if(mouse_y < mouse_y_min) mouse_y = mouse_y_min;
++        if(mouse_y > mouse_y_max) mouse_y = mouse_y_max;
++        break;
++    case 0x0007: // Set X range
++        mouse_x_min = cpuGetCX();
++        mouse_x_max = cpuGetDX();
++        break;
++    case 0x0008: // Set Y range
++        mouse_y_min = cpuGetCX();
++        mouse_y_max = cpuGetDX();
++        break;
++    case 0x000B: // Get motion counters (mickeys)
++        cpuSetCX(mouse_mickey_x);
++        cpuSetDX(mouse_mickey_y);
++        mouse_mickey_x = 0;
++        mouse_mickey_y = 0;
++        break;
++    case 0x000C: // Set user handler — accept but ignore
++        break;
++    case 0x00FF: // Custom: set button state directly (BX = buttons)
++        mouse_buttons = cpuGetBX() & 3;
++        break;
++    default:
++        debug(debug_int, "UNHANDLED INT 33h, AX=%04x\n", ax);
++        break;
++    }
++}
+diff --git a/src/dos.h b/src/dos.h
+index 32e9b77..d13a7ba 100644
+--- a/src/dos.h
++++ b/src/dos.h
+@@ -12,3 +12,4 @@ void intr2f(void);
+ NORETURN void intr22(void);
+ void intr28(void);
+ void intr29(void);
++void intr33(void);
+diff --git a/src/emu.h b/src/emu.h
+index 2981d4f..07c8ddc 100644
+--- a/src/emu.h
++++ b/src/emu.h
+@@ -30,6 +30,7 @@ void emulator_update(void);
+ // IRQ-0 to IRQ-7 call INT-08 to INT-0F
+ // IRQ-8 to IRQ-F call INT-70 to INT-77
+ void cpuTriggerIRQ(int num);
++void cpuTriggerInt(int int_num);
+ 
+ // Register reading/writing
+ void cpuSetAL(unsigned v);
+diff --git a/src/main.c b/src/main.c
+index 7d9c9f5..844e0c8 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -144,9 +144,48 @@ void bios_routine(unsigned inum)
+     else if(inum == 0x2f)
+         intr2f();
+     else if(inum == 0x8)
+-        ; // Timer interrupt - nothing to do
++    {
++        // Timer interrupt: increment BIOS tick counter at 0040:006C (4 bytes)
++        uint32_t ticks = get32(0x46C);
++        ticks++;
++        put32(0x46C, ticks);
++
++        // Chain to INT 1Ch (user timer tick) through the IVT.
++        // Stack currently has [ret_ip, ret_cs, ret_flags] from interrupt(8).
++        // We want the IRET (from do_instruction(0xCF)) to jump to INT 1Ch,
++        // and INT 1Ch's IRET to return to the original caller.
++        //
++        // Target stack layout (SP at top):
++        //   SP+0:  int1c_ip    ← IRET from here goes to INT 1Ch
++        //   SP+2:  int1c_cs
++        //   SP+4:  flags (IF=1)
++        //   SP+6:  ret_ip      ← INT 1Ch's IRET returns to original caller
++        //   SP+8:  ret_cs
++        //   SP+10: ret_flags
++        uint16_t ret_ip = cpuGetStack(0);
++        uint16_t ret_cs = cpuGetStack(2);
++        uint16_t ret_flags = cpuGetStack(4);
++        uint16_t int1c_ip = get16(0x1C * 4);
++        uint16_t int1c_cs = get16(0x1C * 4 + 2);
++
++        // Grow stack by 6 bytes for the extra IRET frame
++        cpuSetSP(cpuGetSP() - 6);
++        uint32_t sp_base = cpuGetSS() * 16 + cpuGetSP();
++
++        // Top: INT 1Ch entry (popped by the simulated IRET)
++        put16(sp_base + 0, int1c_ip);
++        put16(sp_base + 2, int1c_cs);
++        put16(sp_base + 4, ret_flags | 0x0200); // IF=1
++
++        // Below: original return (popped by INT 1Ch's IRET)
++        put16(sp_base + 6, ret_ip);
++        put16(sp_base + 8, ret_cs);
++        put16(sp_base + 10, ret_flags);
++    }
+     else if(inum == 0x9)
+         keyb_handle_irq(); // Keyboard interrupt
++    else if(inum == 0x33)
++        intr33(); // Mouse driver
+     else
+         debug(debug_int, "UNHANDLED INT %02x, AX=%04x\n", inum, cpuGetAX());
+ }
+@@ -328,7 +367,8 @@ int main(int argc, char **argv)
+     timer_action.sa_handler = timer_alarm;
+     sigemptyset(&exit_action.sa_mask);
+     sigemptyset(&timer_action.sa_mask);
+-    exit_action.sa_flags = timer_action.sa_flags = 0;
++    exit_action.sa_flags = 0;
++    timer_action.sa_flags = SA_RESTART; // Restart syscalls interrupted by timer
+     sigaction(SIGALRM, &timer_action, NULL);
+     // Install an exit handler to allow exit functions to run
+     sigaction(SIGHUP, &exit_action, NULL);
+diff --git a/src/video.c b/src/video.c
+index c5b1988..47d83aa 100644
+--- a/src/video.c
++++ b/src/video.c
+@@ -213,6 +213,8 @@ static unsigned get_last_used_row(void)
+ 
+ static void exit_video(void)
+ {
++    if(!tty_file)
++        return;
+     vid_cursor = 1;
+     check_screen();
+     unsigned max = get_last_used_row();
+@@ -228,10 +230,25 @@ static void init_video(void)
+     debug(debug_video, "starting video emulation.\n");
+     int tty_fd = open("/dev/tty", O_NOCTTY | O_WRONLY);
+     if(tty_fd < 0)
+-        print_error("error at open TTY, %s\n", strerror(errno));
++    {
++        // Headless mode — no TTY available. Still mark as initialized
++        // so INT 10h BIOS calls work (cursor queries, etc.)
++        debug(debug_video, "no TTY available, headless video mode.\n");
++        video_initialized = 1;
++        term_cursor = 1;
++        term_color = 0x07;
++        return;
++    }
+     tty_file = fdopen(tty_fd, "w");
+     if(!tty_file)
+-        print_error("error at open TTY, %s\n", strerror(errno));
++    {
++        close(tty_fd);
++        debug(debug_video, "fdopen TTY failed, headless video mode.\n");
++        video_initialized = 1;
++        term_cursor = 1;
++        term_color = 0x07;
++        return;
++    }
+     fputs("\x1b[?7l", tty_file); // Disable automatic margin
+     atexit(exit_video);
+     video_initialized = 1;
+@@ -426,8 +443,8 @@ static void debug_screen(void)
+ // Compares current screen with memory data
+ void check_screen(void)
+ {
+-    // Exit if not in video mode
+-    if(!video_initialized)
++    // Exit if not in video mode or headless
++    if(!video_initialized || !tty_file)
+         return;
+ 
+     debug(debug_video, "check_screen, redrawing\n");
