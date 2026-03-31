@@ -31,6 +31,10 @@ Test harness ──→ _MAGIC_/__WIN__.TX ──→ WINMCP.EXE (Win16 app)
 
 The two agents run independently and simultaneously. The DOS TSR handles real-mode operations (memory, ports, BIOS, files, keyboard). The Win16 app handles protected-mode Windows operations (windows, messages, tasks, GDI, DDE, clipboard, GUI automation).
 
+## Pre-built binaries
+
+`DOSMCP.COM`, `WINMCP.EXE`, and `WINMCHK.DLL` are pre-built and available in [`share/`](share/) — no compiler needed to use them. Copy them into your DOS/Windows environment and run.
+
 ## Quick start
 
 ### Build and test (Win16 — requires display)
