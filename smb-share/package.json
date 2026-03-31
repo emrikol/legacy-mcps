@@ -1,0 +1,22 @@
+{
+  "name": "smb-share",
+  "version": "1.0.0",
+  "description": "",
+  "main": "lanman-server.js",
+  "scripts": {
+    "start": "node lanman-server.js",
+    "lint": "eslint *.js",
+    "lint:fix": "eslint *.js --fix",
+    "format": "prettier --write *.js",
+    "format:check": "prettier --check *.js",
+    "check": "eslint *.js && prettier --check *.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "eslint": "^10.0.3",
+    "prettier": "^3.8.1"
+  }
+}

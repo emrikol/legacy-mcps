@@ -36,6 +36,10 @@ share/VGASYS.FO_
 
 # IPC temp files
 share/_MAGIC_/
+smb-share/share/_MAGIC_/
+
+# SMB server runtime logs
+smb-share/*.log
 
 # OS files
 .DS_Store
