@@ -1056,8 +1056,8 @@ function ensureMagicDir() {
 
 function cleanup(includeStatus) {
   // Remove TX, RX (and optionally ST) in both cases
-  var names = ['__MCP__.TX', '__MCP__.RX', '__MCP__.TT', '__MCP__.TW', '__MCP__.SCR', '__MCP__.OUT', '__MCP__.LR',
-               '__mcp__.tx', '__mcp__.rx', '__mcp__.tt', '__mcp__.tw', '__mcp__.scr', '__mcp__.out', '__mcp__.lr'];
+  var names = ['__MCP__.TX', '__MCP__.RX', '__MCP__.RW', '__MCP__.TT', '__MCP__.TW', '__MCP__.SCR', '__MCP__.OUT', '__MCP__.LR', '__MCP__.LW',
+               '__mcp__.tx', '__mcp__.rx', '__mcp__.rw', '__mcp__.tt', '__mcp__.tw', '__mcp__.scr', '__mcp__.out', '__mcp__.lr', '__mcp__.lw'];
   if (includeStatus) {
     names.push('__MCP__.ST', '__mcp__.st');
   }
@@ -1100,6 +1100,11 @@ function waitForRxFile(timeoutMs) {
           var content = fs.readFileSync(rx, 'utf8').trim();
           if (content.length > 0) {
             clearInterval(timer);
+            var consumedTx = findFile('__MCP__.TX');
+            if (!consumedTx || fs.statSync(consumedTx).size !== 0) {
+              reject(new Error('DOSMCP did not retain the consumed TX inode at size zero'));
+              return;
+            }
             try { fs.unlinkSync(rx); } catch (_) { /* ignore */ }
             // Handle long response overflow
             if (content === 'OK @LR') {

@@ -24,7 +24,7 @@
 
 'use strict';
 
-const { WinAuto } = require('../lib/win-auto');
+const { withWinAutoSession } = require('../lib/win-session');
 const path = require('path');
 
 const magicIdx = process.argv.indexOf('--magic-dir');
@@ -34,12 +34,8 @@ const magicDir = magicIdx >= 0
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function main() {
-  const win = new WinAuto({ magicDir, timeout: 10000 });
-
-  console.log('Connecting to WIN-MCP...');
-  await win.waitForReady();
-  console.log('Connected.\n');
+async function automate(win) {
+  console.log('Connected to readiness- and source-identity-verified WINMCP.\n');
 
   // -- Launch Minesweeper --
   console.log('Launching Minesweeper...');
@@ -112,6 +108,10 @@ async function main() {
   await sleep(500);
 
   console.log('Done!');
+}
+
+async function main() {
+  await withWinAutoSession({ magicDir, timeout: 10000 }, automate);
 }
 
 main().catch(err => {

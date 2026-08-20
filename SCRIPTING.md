@@ -5,25 +5,23 @@ A Node.js library for automating Windows 3.x applications running inside DOSBox-
 ## Quick Start
 
 ```js
-const { WinAuto } = require('./lib/win-auto');
+const { withWinAutoSession } = require('./lib/win-session');
 
-const win = new WinAuto({ magicDir: './share/_MAGIC_' });
-await win.waitForReady();
+await withWinAutoSession({ magicDir: './share/_MAGIC_' }, async win => {
+  // Launch Notepad, type text, select all, copy to clipboard
+  const notepad = await win.exec('NOTEPAD.EXE');
+  const edit = await notepad.locator('Edit');
+  await edit.type('Hello from 2026!');
+  await edit.selectAll();
+  await edit.copy();
 
-// Launch Notepad, type text, select all, copy to clipboard
-const notepad = await win.exec('NOTEPAD.EXE');
-const edit = await notepad.locator('Edit');
-await edit.type('Hello from 2026!');
-await edit.selectAll();
-await edit.copy();
+  // Verify clipboard
+  const text = await win.getClipboard();
+  console.log(text);
 
-// Verify clipboard
-const text = await win.getClipboard();
-console.log(text); // "Hello from 2026!"
-
-// Screenshot and close
-await win.capture(notepad);
-await notepad.close();
+  await win.capture(notepad);
+  await notepad.close();
+});
 ```
 
 ## Setup
@@ -43,6 +41,91 @@ const win = new WinAuto({
 await win.waitForReady();  // Blocks until WINMCP.EXE signals READY
 ```
 
+For multi-command automation, prefer `withWinAutoSession`. It holds one
+advisory cross-process lease, waits for the exact `READY` marker, verifies
+`META IDENTITY` against this checkout's source contract, and releases the
+lease after the callback. The lease serializes only clients that honor it; it
+is not authentication and it does not make several guest commands atomic.
+
+## Generic host CLI
+
+`bin/winmcp.js` exposes the same controller without application-specific
+defaults:
+
+```bash
+node bin/winmcp.js status
+node bin/winmcp.js windows
+node bin/winmcp.js exec --wait-for Calculator -- CALC.EXE
+node bin/winmcp.js exec --no-wait -- NOTEPAD.EXE README.TXT
+node bin/winmcp.js task info PROGMAN
+node bin/winmcp.js module segments KERNEL
+node bin/winmcp.js memory read 1234:00000000 16
+node bin/winmcp.js window locator-id 1234 100
+node bin/winmcp.js sequence examples/win-sequences/health-check.json
+```
+
+`exec` requires exactly one explicit launch policy:
+
+```text
+exec --no-wait -- PROGRAM [ARG...]
+exec --wait-for TITLE -- PROGRAM [ARG...]
+```
+
+The CLI joins the individual program tokens with spaces, validates the
+resulting bounded printable command, and sends it directly to WINMCP. It does
+not use a host shell. `--wait-for` waits for a window whose title contains
+`TITLE`; `--no-wait` returns after the guest accepts the launch request.
+
+Use `memory write-unsafe ... --confirm-unsafe-memory-write` only in a
+disposable session. A write attempt sets the in-process `manipulated` state
+before dispatch because verification or audit failure may still leave changed
+guest state. The guest appends its own verified audit receipt on success. The
+generic CLI rejects this command through its raw-send and sequence routes.
+Regardless of the command result, the guest session is permanently manipulated
+for evidence purposes. Clearing an uncertain-command marker does not make that
+session pristine again.
+
+Sequence files are JSON arrays of 1–256 literal printable command strings,
+each at most 511 ASCII bytes, matching WINMCP's command buffer. Commands run
+serially under one host lease and fail on the first `ERR` by default.
+`--continue-on-error` changes only host
+iteration. A sequence is not a guest transaction: Windows may run between
+mailbox commands.
+
+`bin/dosmcp.js` uses the same bounded transport and source-identity preflight:
+
+```bash
+node bin/dosmcp.js identity
+node bin/dosmcp.js send -- SYS INFO
+```
+
+DOSMCP commands are limited to 255 printable ASCII bytes, matching the guest's
+command buffer.
+
+The mailbox has no authentication. These clients deliberately expose all
+debugger-readable data, including password-styled control text. The advisory
+lease serializes cooperating host clients only.
+
+Before publishing a request, the transport writes
+`.winmcp-host-command.inflight` or `.dosmcp-host-command.inflight` with the
+versioned content `uncertain-command-v1\n`. It removes the marker only after it
+has consumed and cleaned up the matching response. A timeout or interrupted
+client therefore makes later processes fail closed instead of assigning a late
+response to a new command.
+
+After externally replacing or resetting the disposable guest, clear the
+retained marker with the corresponding explicit operation:
+
+```bash
+node bin/winmcp.js reset --confirm-guest-reset
+node bin/dosmcp.js reset --confirm-guest-reset
+```
+
+The command does not reset the guest. It holds the same advisory lease and
+refuses to clear the marker while a response or unconsumed request remains.
+Library callers can perform the DOS operation with
+`resetDosMcpMailbox({confirmGuestReset: true})`.
+
 ## API Reference
 
 ### WinAuto (Controller)
@@ -54,7 +137,20 @@ await win.waitForReady();  // Blocks until WINMCP.EXE signals READY
 | `waitForReady(timeout?)` | `this` | Wait for WIN-MCP to initialize |
 | `ping()` | `boolean` | Liveness check |
 | `version()` | `string` | Get version string |
+| `identity(features?)` | `object` | Verify the live source identity and capabilities |
 | `quit()` | `string` | Shut down WIN-MCP |
+
+#### Task, module, and memory inspection
+
+`taskInfo`, `taskCsip`, `taskStack`, `moduleInfo`, and `moduleProc` return the
+guest's bounded inspection payload. `moduleSegments` returns validated
+structured records, and `readMemory` returns a validated address-joined
+`Buffer`. `writeMemoryUnsafe` requires
+`{confirmUnsafe: true}` and verifies the guest's before/after receipt.
+
+`Window.locator(className, text)` may inspect class and text.
+`Window.locatorById(id)` performs the separate direct-ID lookup without
+reading control text and fails on missing or ambiguous IDs.
 
 #### Launching Programs
 
@@ -525,7 +621,7 @@ await notepad.type(...)  → writes __WIN__.TX       → polls, reads TX
 
 There is no persistent connection — each command is a write/read cycle. The library handles:
 
-- Atomic file writes (temp file + rename)
+- Synced private writes with checked atomic-rename TX publication under the advisory lease
 - Case-insensitive file lookup (DOSBox-X vs emu2)
 - Long response overflow (`OK @LR` → read `__WIN__.LR`)
 - Timeout and error handling

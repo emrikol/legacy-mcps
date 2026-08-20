@@ -48,6 +48,45 @@ load=S:\WINMCP.EXE S:
 
 The command-line argument specifies the drive letter where `_MAGIC_/` lives.
 
+## Generic host automation
+
+The repository-level `bin/winmcp.js` command provides a source-identity-verified
+CLI over the Playwright-like `WinAuto` library:
+
+```bash
+node bin/winmcp.js status
+node bin/winmcp.js windows
+node bin/winmcp.js exec --wait-for Calculator -- CALC.EXE
+node bin/winmcp.js exec --no-wait -- NOTEPAD.EXE README.TXT
+node bin/winmcp.js task info PROGMAN
+node bin/winmcp.js window locator-id 1234 100
+node bin/winmcp.js sequence examples/win-sequences/health-check.json
+node bin/winmcp.js reset --confirm-guest-reset
+```
+
+`exec` requires either `--wait-for TITLE -- PROGRAM [ARG...]` or
+`--no-wait -- PROGRAM [ARG...]`. The CLI joins the argument tokens, validates
+the resulting bounded printable command, and sends it directly to WINMCP
+without host-shell evaluation. Each WINMCP command is limited to 511 printable
+ASCII bytes, matching the guest command buffer.
+
+For normal commands, the CLI holds one advisory host lease across readiness,
+identity verification, and the complete requested workflow. This prevents
+compliant host clients from interleaving mailbox commands; it does not make
+several commands one guest transaction and it is not authentication. Reads are
+intentionally unredacted, including password-styled controls. Unsafe memory
+writes require a literal confirmation option and permanently make the session
+manipulated evidence.
+
+The host transport creates `.winmcp-host-command.inflight` before publishing a
+command and removes it only after consuming the matching response. A timeout or
+client interruption leaves the marker, and later processes fail closed. The
+`reset --confirm-guest-reset` operation clears it only after you externally
+replace or reset the disposable guest; the command does not reset the guest.
+It holds the advisory lease and refuses a pending response or unconsumed
+request. Clearing this uncertainty marker does not restore pristine evidence
+after an unsafe memory-write attempt.
+
 ## Command Reference
 
 All commands are plain text written to `__WIN__.TX`. Responses appear in `__WIN__.RX`.

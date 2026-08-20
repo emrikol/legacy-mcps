@@ -14,6 +14,15 @@ Two small programs that run inside vintage operating systems and expose their AP
 
 Both use the same protocol: the host writes a command to a text file, the agent reads it, executes it, and writes a response to another text file. No network stack, no sockets, no shared memory — just files. This works because the "files" live on a shared drive (SMB mount, DOSBox-X host directory mount, or emu2 drive mapping).
 
+Generic host clients are included for both mailboxes. `bin/winmcp.js` exposes
+the Playwright-like WinAuto controller, task/module inspection, structured
+segment and memory results, literal command sequences, recording, and
+playback. `bin/dosmcp.js` provides a serialized DOSMCP command client. Both
+verify the live agent's reported source-contract identity against this checkout
+before normal command sessions. This compatibility check is not
+authentication; the explicit post-guest-reset operation does not contact or
+authenticate the guest.
+
 - **[smb-share](smb-share/)** — A custom Node.js LAN Manager (LANMAN2.1) SMB server for connecting real or emulated Windows for Workgroups 3.11 machines to the host. Modern Samba won't negotiate down to the ancient dialect WFW uses — this purpose-built server does.
 
 ## Architecture
@@ -65,6 +74,38 @@ node scripts/test-guest-tool-identities.js
 The receipt identifies reviewed source and build recipes; it is not a claim of
 bit-for-bit reproducibility across compilers or hosts.
 
+### Host client quick start
+
+```bash
+node bin/winmcp.js status
+node bin/winmcp.js windows
+node bin/winmcp.js exec --wait-for Calculator -- CALC.EXE
+node bin/winmcp.js exec --no-wait -- NOTEPAD.EXE README.TXT
+node bin/winmcp.js sequence examples/win-sequences/health-check.json
+node bin/dosmcp.js identity
+node bin/dosmcp.js send -- SYS INFO
+```
+
+`exec` requires an explicit wait policy. The CLI joins the individual program
+argument tokens, validates the resulting bounded printable command, and sends
+it directly to WINMCP; the host does not invoke a shell. WINMCP commands are
+limited to 511 printable ASCII bytes; DOSMCP commands are limited to 255.
+
+Pass `--magic-dir /absolute/path/to/_MAGIC_` when the shared directory is not
+the repository default. Before publishing a command, the clients create a
+durable per-agent inflight marker. A timeout or interrupted client leaves that
+mailbox uncertain across later client processes because a late response could
+otherwise be mistaken for a later command. After externally replacing or
+resetting the disposable guest, clear the retained state explicitly:
+
+```bash
+node bin/winmcp.js reset --confirm-guest-reset
+node bin/dosmcp.js reset --confirm-guest-reset
+```
+
+The confirmation does not reset the guest. Reset holds the advisory host lease
+and refuses a pending response or unconsumed request.
+
 ### Requirements
 
 | Tool | Version | Purpose |
@@ -104,7 +145,10 @@ ERR INVALID_HWND
 
 **Status file** (`__WIN__.ST` / `__MCP__.ST`) contains `READY` when the agent has initialized and is polling.
 
-**Atomic writes:** The host writes to a temp file first, then renames it to the TX path. This prevents the agent from reading a partially-written command.
+**Atomic writes:** The generic host clients write and sync a private temporary
+file, then publish it at the TX path with a checked atomic rename. This prevents
+the agent from reading a partially written command. The cooperating-client
+lease is advisory; a local process that ignores it can race request publication.
 
 ### Security model
 
@@ -190,19 +234,19 @@ It binds to loopback but has no authentication; see [PATCHES.md](PATCHES.md#cont
 
 ## Scripting
 
-The `lib/win-auto.js` library provides a Playwright-style async API for driving win-mcp from Node.js scripts:
+The `lib/win-auto.js` library provides a Playwright-style async API for driving win-mcp from Node.js scripts. Use `withWinAutoSession` to hold one cross-process mailbox lease and verify the live build identity across a complete workflow:
 
 ```js
-const { WinAuto } = require('./lib/win-auto');
-const win = new WinAuto({ magicDir: './share/_MAGIC_' });
-await win.waitForReady();
+const { withWinAutoSession } = require('./lib/win-session');
 
-const notepad = await win.exec('NOTEPAD.EXE');
-const edit = await notepad.locator('Edit');
-await edit.type('Hello from 2026!');
-await edit.selectAll();
-await notepad.capture();
-await notepad.close();
+await withWinAutoSession({ magicDir: './share/_MAGIC_' }, async win => {
+  const notepad = await win.exec('NOTEPAD.EXE');
+  const edit = await notepad.locator('Edit');
+  await edit.type('Hello from 2026!');
+  await edit.selectAll();
+  await notepad.capture();
+  await notepad.close();
+});
 ```
 
 See [SCRIPTING.md](SCRIPTING.md) for the full API reference.
@@ -230,8 +274,16 @@ legacy-mcps/
 ├── WIN-MCP.md             Original architecture design document
 ├── lib/
 │   ├── win-auto.js        Node.js scripting library (Playwright-style)
+│   ├── win-session.js     Leased, source-identity-verified WinAuto workflow
+│   ├── win-sequence.js    Bounded literal WINMCP sequences
+│   ├── dos-mcp.js         Serialized DOSMCP host client
+│   ├── mcp-mailbox.js     Bounded file-mailbox transport
+│   ├── host-command-lease.js Advisory cross-process channel ownership
 │   ├── dosbox-control.js  DOSBox-X control/debugger TCP client
 │   └── win-compare.js     BMP screenshot comparison utility
+├── bin/
+│   ├── winmcp.js          Generic WinAuto/inspection/sequence CLI
+│   └── dosmcp.js          Generic DOSMCP CLI
 ├── examples/
 │   ├── notepad.js         Demo: type text, read clipboard, screenshot
 │   ├── minesweeper.js     Demo: automate Minesweeper (Win16)

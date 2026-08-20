@@ -11324,24 +11324,10 @@ write_rx_checked:
 
         ; Write full response to LR file
         mov     [rx_len], cx
-        ; Delete old LR file (ignore errors)
-        mov     dx, path_lr
-        mov     ah, 0x41
-        int     0x21
-        ; Create LR file
-        mov     dx, path_lr
-        xor     cx, cx
-        mov     ah, 0x3C
-        int     0x21
+        mov     dx, path_lw
+        mov     di, path_lr
+        call    write_file_atomic
         jc      .rxc_fallback
-        ; Write response to LR
-        mov     bx, ax
-        mov     dx, si
-        mov     cx, [rx_len]
-        mov     ah, 0x40
-        int     0x21
-        mov     ah, 0x3E
-        int     0x21
         ; Write "OK @LR" to RX
         mov     si, resp_at_lr
         jmp     write_rx
@@ -11363,26 +11349,85 @@ write_rx:
         pop     si
         mov     [rx_len], cx
 
-        ; Delete existing RX file first (ignore errors)
-        mov     dx, path_rx
+        mov     dx, path_rw
+        mov     di, path_rx
+        call    write_file_atomic
+        ret
+
+; write_file_atomic — fully write a temporary file, then rename it into place
+; Input: DS:DX = temporary path, DS:DI = final path, DS:SI = data,
+;        [rx_len] = byte count
+; Output: carry clear on success, set on failure; all registers preserved
+write_file_atomic:
+        push    ax
+        push    bx
+        push    cx
+        push    dx
+        push    si
+        push    di
+        push    bp
+        push    es
+        mov     bp, dx
+
+        ; A prior interrupted publication may have left only the private temp.
         mov     ah, 0x41
         int     0x21
 
-        mov     dx, path_rx
+        mov     dx, bp
         xor     cx, cx
         mov     ah, 0x3C
         int     0x21
-        jc      .rx_fail
-
+        jc      .wfa_fail
         mov     bx, ax
         mov     dx, si
         mov     cx, [rx_len]
+        mov     byte [wfa_write_ok], 0
         mov     ah, 0x40
         int     0x21
-
+        jc      .wfa_write_bad
+        cmp     ax, [rx_len]
+        jne     .wfa_write_bad
+        mov     byte [wfa_write_ok], 1
+        jmp     .wfa_close
+.wfa_write_bad:
+.wfa_close:
         mov     ah, 0x3E
         int     0x21
-.rx_fail:
+        jc      .wfa_cleanup
+        cmp     byte [wfa_write_ok], 1
+        jne     .wfa_cleanup
+
+        ; DOS rename requires DS:DX old name and ES:DI new name.
+        mov     dx, di
+        mov     ah, 0x41
+        int     0x21
+        push    ds
+        pop     es
+        mov     dx, bp
+        mov     ah, 0x56
+        int     0x21
+        jc      .wfa_cleanup
+        clc
+        jmp     .wfa_done
+.wfa_cleanup:
+        mov     dx, bp
+        mov     ah, 0x41
+        int     0x21
+.wfa_fail:
+        stc
+.wfa_done:
+        pushf
+        pop     word [wfa_flags]
+        pop     es
+        pop     bp
+        pop     di
+        pop     si
+        pop     dx
+        pop     cx
+        pop     bx
+        pop     ax
+        push    word [wfa_flags]
+        popf
         ret
 
 write_status_ready:
@@ -11467,6 +11512,8 @@ path_tx:        db  'X:\_MAGIC_\__MCP__.TX', 0
                 times PATH_BUF_SIZE - ($ - path_tx) db 0
 path_rx:        db  'X:\_MAGIC_\__MCP__.RX', 0
                 times PATH_BUF_SIZE - ($ - path_rx) db 0
+path_rw:        db  'X:\_MAGIC_\__MCP__.RW', 0
+                times PATH_BUF_SIZE - ($ - path_rw) db 0
 path_st:        db  'X:\_MAGIC_\__MCP__.ST', 0
                 times PATH_BUF_SIZE - ($ - path_st) db 0
 path_tt:        db  'X:\_MAGIC_\__MCP__.TT', 0
@@ -11479,22 +11526,28 @@ path_out:       db  'X:\_MAGIC_\__MCP__.OUT', 0
                 times PATH_BUF_SIZE - ($ - path_out) db 0
 path_lr:        db  'X:\_MAGIC_\__MCP__.LR', 0
                 times PATH_BUF_SIZE - ($ - path_lr) db 0
+path_lw:        db  'X:\_MAGIC_\__MCP__.LW', 0
+                times PATH_BUF_SIZE - ($ - path_lw) db 0
 
 ; Path filename suffixes for rebuild
-NUM_PATHS equ 8
+NUM_PATHS equ 10
 path_table:
-        dw  path_tx, path_rx, path_st, path_tt, path_scr, path_bmp, path_out, path_lr
+        dw  path_tx, path_rx, path_rw, path_st, path_tt, path_scr, path_bmp, path_out, path_lr, path_lw
 path_suffixes:
         db  '__MCP__.TX', 0
         db  '__MCP__.RX', 0
+        db  '__MCP__.RW', 0
         db  '__MCP__.ST', 0
         db  '__MCP__.TT', 0
         db  '__MCP__.SCR', 0
         db  '__MCP__.BMP', 0
         db  '__MCP__.OUT', 0
         db  '__MCP__.LR', 0
+        db  '__MCP__.LW', 0
 
 drive_letter:   db  'Z'
+wfa_flags:      dw  0
+wfa_write_ok:   db  0
 
 ; Command verb strings
 ; Family prefix strings (with trailing space for prefix matching)

@@ -83,6 +83,25 @@ function verifyControlInspectionSource(source) {
   }
 }
 
+function verifyAtomicResponsePublication(winSource, dosSource) {
+  const winWriter = bodyBetween(winSource, 'static BOOL write_file_atomic',
+    'static void write_response');
+  ordered(winWriter, 'write_file(temporary, data, len)', 'delete_file(path)',
+    'rename(temporary, path)');
+  const winResponse = bodyBetween(winSource, 'static void write_response',
+    '/* ============================================================ */\n/* META commands');
+  assert.equal((winResponse.match(/write_file_atomic\(/g) || []).length, 4);
+  assert.doesNotMatch(winResponse, /write_file\((?:lr_path|rx_path)/);
+
+  const dosWriter = bodyBetween(dosSource, 'write_file_atomic:', 'write_status_ready:');
+  ordered(dosWriter, 'mov     ah, 0x3C', 'mov     ah, 0x40',
+    'cmp     ax, [rx_len]', 'mov     ah, 0x3E', 'mov     ah, 0x56');
+  const dosResponse = bodyBetween(dosSource, 'write_rx_checked:', 'write_status_ready:');
+  ordered(dosResponse, 'mov     dx, path_lw', 'mov     di, path_lr',
+    'call    write_file_atomic', 'mov     dx, path_rw', 'mov     di, path_rx',
+    'call    write_file_atomic');
+}
+
 const contract = checkedContract();
 const repoRoot = path.resolve(__dirname, '..');
 assert.deepEqual(Object.keys(contract.tools), ['DOSMCP', 'WINMCP']);
@@ -100,8 +119,10 @@ for (const [name, tool] of Object.entries(contract.tools)) {
   verifyTrackedBinaries(name, tool, digest);
 }
 const winSource = fs.readFileSync(path.join(repoRoot, 'win-mcp/src/winmcp.c'), 'utf8');
+const dosSource = fs.readFileSync(path.join(repoRoot, 'dos-mcp/src/dosmcp.asm'), 'utf8');
 verifyAuditRollbackSource(winSource);
 verifyControlInspectionSource(winSource);
+verifyAtomicResponsePublication(winSource, dosSource);
 for (const mutant of [
   winSource.replace(
     'restored = restore_memory(selector, offset, before_write_buf, byteCount);',
@@ -134,6 +155,14 @@ for (const mutant of [
     'do {\n        GetWindowText(ctrl, actual, sizeof(actual));'),
 ]) {
   assert.throws(() => verifyControlInspectionSource(mutant));
+}
+for (const [mutantWin, mutantDos] of [
+  [winSource.replace('rename(temporary, path)', 'write_file(path, data, len)'), dosSource],
+  [winSource, dosSource.replace('mov     dx, bp\n        mov     ah, 0x56',
+    'mov     dx, bp\n        mov     ah, 0x3C')],
+  [winSource, dosSource.replace('cmp     ax, [rx_len]', 'cmp     ax, ax')],
+]) {
+  assert.throws(() => verifyAtomicResponsePublication(mutantWin, mutantDos));
 }
 const winMakefile = fs.readFileSync(path.join(repoRoot, 'win-mcp/src/Makefile'), 'utf8');
 assert.match(winMakefile, /\$\(DLL_OBJ\): \$\(DLL_SRC\) Makefile/);

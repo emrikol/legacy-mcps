@@ -31,6 +31,35 @@ C:\> DOSMCP.COM Z: /T     # TSR mode (installs and returns to DOS)
 
 The argument specifies the drive letter where `_MAGIC_/` lives.
 
+## Generic host client
+
+From the repository root, `identity` and `send` verify the guest's reported
+source identity before requested work. Every operation holds one advisory
+cross-process mailbox lease for the complete invocation:
+
+```bash
+node bin/dosmcp.js identity
+node bin/dosmcp.js send -- SYS INFO
+node bin/dosmcp.js --magic-dir /absolute/share/_MAGIC_ send -- MEM FREE
+node bin/dosmcp.js reset --confirm-guest-reset
+```
+
+Commands are limited to 255 printable ASCII bytes, matching the DOSMCP guest
+command buffer.
+
+The lease is honored only by cooperating clients and is not authentication.
+Mailbox access can read or mutate DOS memory, ports, files, and machine state.
+The client creates `.dosmcp-host-command.inflight` before publishing a command
+and removes it only after consuming the matching response. A timeout or client
+interruption leaves that durable marker, so later processes fail closed rather
+than assigning a late response to a new command.
+
+The `reset --confirm-guest-reset` operation does not reset the guest. Use it
+only after externally replacing or resetting the disposable guest. It holds
+the advisory lease, does not contact the guest, and refuses a pending response
+or unconsumed request. The equivalent library helper is
+`resetDosMcpMailbox({confirmGuestReset: true})`.
+
 ## Command Reference
 
 All commands are plain text written to `__MCP__.TX`. Responses appear in `__MCP__.RX`.

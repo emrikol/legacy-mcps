@@ -45,6 +45,17 @@ cd dos-mcp && make test       # TSR mode test via emu2 (headless)
 cd dos-mcp && make testgui    # TSR mode test via DOSBox-X (needs display)
 ```
 
+### Generic host clients (offline)
+
+```bash
+node scripts/test-host-clients.js
+```
+
+This suite exercises mailbox ownership, timeout poisoning, identity parsing,
+DOSMCP transport, the structured WinAuto API, leased sessions, bounded command
+sequences, CLI parsing, and the generic public-source inventory without
+launching a guest.
+
 ---
 
 ## IPC Protocol

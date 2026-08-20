@@ -48,6 +48,7 @@
 #include <stdlib.h>
 #include <direct.h>
 #include <dos.h>
+#include <stdio.h>
 
 /* BM_CLICK doesn't exist in Win16 — simulate with BM_SETSTATE */
 #ifndef BM_CLICK
@@ -57,12 +58,14 @@
 /* IPC file paths — drive letter patched at startup */
 static char tx_path[128] = "C:\\_MAGIC_\\__WIN__.TX";
 static char rx_path[128] = "C:\\_MAGIC_\\__WIN__.RX";
+static char rw_path[128] = "C:\\_MAGIC_\\__WIN__.RW";
 static char st_path[128] = "C:\\_MAGIC_\\__WIN__.ST";
 static char tw_path[128] = "C:\\_MAGIC_\\__WIN__.TW";
 static char bmp_path[128] = "C:\\_MAGIC_\\__WIN__.BMP";
 static char mw_path[128] = "C:\\_MAGIC_\\__WIN__.MW";
 
 static char lr_path[128] = "C:\\_MAGIC_\\__WIN__.LR";
+static char lw_path[128] = "C:\\_MAGIC_\\__WIN__.LW";
 
 static HINSTANCE hAppInst;
 static HWND      hMainWnd;
@@ -265,11 +268,12 @@ static int read_file(const char *path, char *buf, int maxlen) {
 static BOOL write_file(const char *path, const char *data, int len) {
     OFSTRUCT ofs;
     HFILE hf;
+    UINT written;
     hf = OpenFile(path, &ofs, OF_CREATE | OF_WRITE);
     if (hf == HFILE_ERROR) return FALSE;
-    _lwrite(hf, data, len);
-    _lclose(hf);
-    return TRUE;
+    written = _lwrite(hf, data, len);
+    if (_lclose(hf) == HFILE_ERROR) return FALSE;
+    return written == (UINT)len;
 }
 
 static BOOL append_file(const char *path, const char *data, int len) {
@@ -293,15 +297,33 @@ static void delete_file(const char *path) {
     OpenFile(path, &ofs, OF_DELETE);
 }
 
+static BOOL write_file_atomic(const char *path, const char *temporary,
+                              const char *data, int len) {
+    delete_file(temporary);
+    if (!write_file(temporary, data, len)) {
+        delete_file(temporary);
+        return FALSE;
+    }
+    delete_file(path);
+    if (rename(temporary, path) != 0) {
+        delete_file(temporary);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static void write_response(const char *resp) {
     int len;
     len = lstrlen(resp);
     if (len > 3900) {
         /* Long response — write full data to LR file, signal via RX */
-        write_file(lr_path, resp, len);
-        write_file(rx_path, "OK @LR", 6);
+        if (write_file_atomic(lr_path, lw_path, resp, len)) {
+            write_file_atomic(rx_path, rw_path, "OK @LR", 6);
+        } else {
+            write_file_atomic(rx_path, rw_path, "ERR RESPONSE_WRITE_FAILED", 25);
+        }
     } else {
-        write_file(rx_path, resp, len);
+        write_file_atomic(rx_path, rw_path, resp, len);
     }
 }
 
@@ -2947,11 +2969,13 @@ int PASCAL WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         if (drv >= 'a' && drv <= 'z') drv -= 32;
         tx_path[0] = drv;
         rx_path[0] = drv;
+        rw_path[0] = drv;
         st_path[0] = drv;
         tw_path[0] = drv;
         bmp_path[0] = drv;
         mw_path[0] = drv;
         lr_path[0] = drv;
+        lw_path[0] = drv;
         evt_path[0] = drv;
     }
 

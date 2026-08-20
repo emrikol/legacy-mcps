@@ -7,7 +7,7 @@
  * clipboard, captures a screenshot, and closes the window.
  *
  * This is a minimal win-auto.js example showing the basics:
- * - Waiting for the agent to be ready
+ * - Using a leased, readiness- and source-identity-verified session
  * - Launching a program and getting a window handle
  * - Typing text into a control
  * - Reading content via the clipboard
@@ -23,7 +23,7 @@
 
 'use strict';
 
-const { WinAuto } = require('../lib/win-auto');
+const { withWinAutoSession } = require('../lib/win-session');
 const path = require('path');
 
 const magicIdx = process.argv.indexOf('--magic-dir');
@@ -32,39 +32,37 @@ const magicDir = magicIdx >= 0
   : path.resolve(__dirname, '..', 'share', '_MAGIC_');
 
 async function main() {
-  const win = new WinAuto({ magicDir, timeout: 10000 });
+  await withWinAutoSession({ magicDir, timeout: 10000 }, async win => {
+    console.log('Connected to readiness- and source-identity-verified WINMCP.\n');
 
-  console.log('Connecting to WIN-MCP...');
-  await win.waitForReady();
-  console.log('Connected.\n');
+    // Launch Notepad and wait for its window
+    console.log('Launching Notepad...');
+    const notepad = await win.exec('NOTEPAD.EXE');
+    console.log(`Window: hwnd=${notepad.hwnd}\n`);
 
-  // Launch Notepad and wait for its window
-  console.log('Launching Notepad...');
-  const notepad = await win.exec('NOTEPAD.EXE');
-  console.log(`Window: hwnd=${notepad.hwnd}\n`);
+    // Type a message into the edit area
+    const message = 'Hello from win-auto.js!';
+    console.log(`Typing: "${message}"`);
+    await notepad.type(message);
 
-  // Type a message into the edit area
-  const message = 'Hello from win-auto.js!';
-  console.log(`Typing: "${message}"`);
-  await notepad.type(message);
+    // Select all and copy to clipboard, then read it back
+    await notepad.selectAll();
+    await notepad.copy();
+    const clip = await win.getClipboard();
+    console.log('Clipboard:', clip.replace(/^OK /, ''));
 
-  // Select all and copy to clipboard, then read it back
-  await notepad.selectAll();
-  await notepad.copy();
-  const clip = await win.getClipboard();
-  console.log('Clipboard:', clip.replace(/^OK /, ''));
+    // Capture a screenshot of the active window
+    console.log('\nCapturing screenshot...');
+    await win.capture(notepad.hwnd);
+    console.log('Saved to win-mcp/capture/');
 
-  // Capture a screenshot of the active window
-  console.log('\nCapturing screenshot...');
-  await win.capture(notepad.hwnd);
-  console.log('Saved to win-mcp/capture/');
+    // Close Notepad — dismiss the "Save changes?" dialog without saving
+    console.log('\nClosing Notepad...');
+    await notepad.close();
+    await win.ok('ABORT');   // dismiss "Save changes?" dialog
 
-  // Close Notepad — dismiss the "Save changes?" dialog without saving
-  console.log('\nClosing Notepad...');
-  await notepad.close();
-  await win.ok(`ABORT`);   // dismiss "Save changes?" dialog
-
-  console.log('Done.');
+    console.log('Done.');
+  });
 }
 
 main().catch(err => {
