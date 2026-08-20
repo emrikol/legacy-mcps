@@ -1,0 +1,164 @@
+From b23bbf28d81f73f707fe0e05b232f62a3aac34bc Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Tue, 18 Aug 2026 12:00:00 -0400
+Subject: [PATCH 19/19] feat(debugger): match logical NE image bounds
+
+---
+ include/tool_build_identity.h     |  4 +--
+ src/debug/debug.cpp               | 48 +++++++++++++++++++++++--------
+ src/gui/dosbox_control_server.cpp |  2 +-
+ 3 files changed, 39 insertions(+), 15 deletions(-)
+
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+index 01ec83a..860d1e0 100644
+--- a/include/tool_build_identity.h
++++ b/include/tool_build_identity.h
+@@ -1,2 +1,2 @@
+-/* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
+-#define DOSBOX_X_BUILD_ID "6a9e5c44c4d366ecd483d33cd82576aca7e8b77c10fac79cbf33bd5423c7c615"
++/* SHA-256 of the legacy-mcps DOSBox-X source contract. */
++#define DOSBOX_X_BUILD_ID "f415471a9a59821ab0284afcca99241d50a9cb9494e53a08aa4d34ed900e93bf"
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index be2b5b0..f60e4af 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -654,7 +654,8 @@ struct RemoteApiTraceProbe {
+ 
+ enum RemoteApiTraceMode {
+ 	REMOTE_API_TRACE_FIXED,
+-	REMOTE_API_TRACE_LOGICAL
++	REMOTE_API_TRACE_LOGICAL,
++	REMOTE_API_TRACE_LOGICAL_IMAGE
+ };
+ 
+ struct RemoteApiTraceLogicalProbe {
+@@ -5770,7 +5771,7 @@ static std::string RemoteApiTraceStatus(void)
+ 	std::ostringstream out;
+ 	out << "OK ACTIVE=" << (remote_api_trace_active ? 1 : 0)
+ 	    << " CAPACITY=" << remote_api_trace_capacity
+-	    << " PROBES=" << (remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL ?
++	    << " PROBES=" << (remote_api_trace_mode != REMOTE_API_TRACE_FIXED ?
+ 	                       remote_api_trace_logical_probes.size() :
+ 	                       remote_api_trace_probes.size())
+ 	    << " QUEUED=" << remote_api_trace_events.size()
+@@ -5907,26 +5908,39 @@ static bool RemoteReadSelectorWord(uint16_t selector, uint32_t offset,
+ static void RemoteApiTraceObserve(void)
+ {
+ 	if (!remote_api_trace_active) return;
+-	if (remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL) {
++	if (remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL ||
++	    remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL_IMAGE) {
+ 		if (!cpu.pmode || (reg_flags & FLAG_VM)) return;
+ 		const uint16_t selector = SegValue(cs);
+ 		const uint32_t base = SegPhys(cs);
+ 		const uint32_t limit = SegLimit(cs);
+ 		bool has_address_candidate = false;
++		const bool image_bounds =
++		        remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL_IMAGE;
+ 		for (const auto &probe : remote_api_trace_logical_probes) {
+-			if (probe.limit == limit && probe.offset == reg_eip)
++			const bool compatible_limit = image_bounds ? probe.limit <= limit :
++			                                                probe.limit == limit;
++			if (compatible_limit && probe.offset == reg_eip)
+ 				has_address_candidate = true;
+ 		}
+ 		if (!has_address_candidate) return;
+-		if (static_cast<uint64_t>(base) + limit > UINT32_MAX) {
++		if (!image_bounds && static_cast<uint64_t>(base) + limit > UINT32_MAX) {
+ 			++remote_api_trace_dropped;
+ 			return;
+ 		}
+ 		std::map<uint16_t, uint64_t> matches;
+ 		std::set<uint16_t> evaluated;
+ 		for (const auto &probe : remote_api_trace_logical_probes) {
+-			if (probe.limit != limit || !evaluated.insert(probe.logical_segment).second)
++			const bool compatible_limit = image_bounds ? probe.limit <= limit :
++			                                                probe.limit == limit;
++			if (!compatible_limit || !evaluated.insert(probe.logical_segment).second)
+ 				continue;
++			const uint64_t signature_end = static_cast<uint64_t>(base) +
++			        probe.signature_offset + probe.signature_length - 1U;
++			if (signature_end > UINT32_MAX) {
++				++remote_api_trace_dropped;
++				return;
++			}
+ 			uint64_t signature = UINT64_C(14695981039346656037);
+ 			for (uint32_t index = 0; index < probe.signature_length; ++index) {
+ 				uint8_t value = 0;
+@@ -5946,6 +5960,11 @@ static void RemoteApiTraceObserve(void)
+ 			++remote_api_trace_dropped;
+ 			return;
+ 		}
++		if (image_bounds && (limit > 0xffffU ||
++		    static_cast<uint64_t>(base) + limit > UINT32_MAX)) {
++			++remote_api_trace_dropped;
++			return;
++		}
+ 		const uint16_t logical_segment = matches.begin()->first;
+ 		const uint64_t signature = matches.begin()->second;
+ 		RemoteApiTraceLogicalBinding &binding =
+@@ -7046,7 +7065,8 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			remote_api_trace_active = true;
+ 			return RemoteApiTraceStatus();
+ 		}
+-		if (action == "STARTLOGICAL") {
++		if (action == "STARTLOGICAL" || action == "STARTLOGICALIMAGE") {
++			const bool image_bounds = action == "STARTLOGICALIMAGE";
+ 			if (!remote_watchpoints.empty())
+ 				return "ERR APITRACE_INCOMPATIBLE_WITH_WATCHPOINTS";
+ 			if (remote_coverage_active)
+@@ -7066,8 +7086,11 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			std::string token;
+ 			while (input >> token) {
+ 				RemoteApiTraceLogicalProbe probe;
+-				if (!RemoteApiTraceParseLogicalProbe(token, probe))
+-					return "ERR APITRACE_LOGICAL_PROBE ID:LSEG:OFFSET:STACK_BYTES_HEX:LIMIT:SIG_OFFSET:SIG_LENGTH:FNV64";
++				if (!RemoteApiTraceParseLogicalProbe(token, probe) ||
++				    (image_bounds && probe.limit > 0xffffU))
++					return image_bounds ?
++					       "ERR APITRACE_LOGICAL_IMAGE_PROBE ID:LSEG:OFFSET:STACK_BYTES_HEX:MIN_LIMIT:SIG_OFFSET:SIG_LENGTH:FNV64" :
++					       "ERR APITRACE_LOGICAL_PROBE ID:LSEG:OFFSET:STACK_BYTES_HEX:LIMIT:SIG_OFFSET:SIG_LENGTH:FNV64";
+ 				if (!ids.insert(probe.id).second)
+ 					return "ERR APITRACE_DUPLICATE_ID";
+ 				if (!addresses.insert(std::make_pair(probe.logical_segment,
+@@ -7092,7 +7115,8 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			}
+ 			if (probes.empty()) return "ERR APITRACE_PROBE_COUNT_RANGE_1_32";
+ 			if (!remote_fileio_active) remote_observer_instruction_sequence = 0;
+-			remote_api_trace_mode = REMOTE_API_TRACE_LOGICAL;
++			remote_api_trace_mode = image_bounds ? REMOTE_API_TRACE_LOGICAL_IMAGE :
++			                                              REMOTE_API_TRACE_LOGICAL;
+ 			remote_api_trace_active = false;
+ 			remote_api_trace_events.clear();
+ 			remote_api_trace_logical_probes = probes;
+@@ -7117,7 +7141,7 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			remote_api_trace_events.clear();
+ 			remote_api_trace_next_sequence = 0;
+ 			remote_api_trace_dropped = 0;
+-			if (remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL)
++			if (remote_api_trace_mode != REMOTE_API_TRACE_FIXED)
+ 				remote_api_trace_bindings.clear();
+ 			return RemoteApiTraceStatus();
+ 		}
+@@ -7135,7 +7159,7 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			}
+ 			return RemoteApiTraceDrain(count);
+ 		}
+-		return "ERR USAGE DEBUG APITRACE (START|STARTLOGICAL|STATUS|DRAIN|STOP|CLEAR)";
++		return "ERR USAGE DEBUG APITRACE (START|STARTLOGICAL|STARTLOGICALIMAGE|STATUS|DRAIN|STOP|CLEAR)";
+ 	}
+ 
+ 	if (command == "COVERAGE") {
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index bf7d1d2..8767fbf 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -142,7 +142,7 @@ static std::string handle_command(const std::string& cmd) {
+                DOSBOX_X_BUILD_ID
+                " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
+ #if C_DEBUG
+-               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,SNAPSHOT,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,APITRACE_LOGICAL_NE,COVERAGE,CHECKPOINT,HASH,INPUT,DETERMINISM,WAIT,CONTINUE"
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,SNAPSHOT,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,APITRACE_LOGICAL_NE,APITRACE_LOGICAL_NE_IMAGE_BOUNDS,COVERAGE,CHECKPOINT,HASH,INPUT,DETERMINISM,WAIT,CONTINUE"
+ #else
+                " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
+ #endif

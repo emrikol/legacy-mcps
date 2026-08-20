@@ -19,7 +19,7 @@ A host-side scripting library (`lib/win-auto.js`) provides a Playwright-style as
 |---|---|
 | `dos-mcp/src/dosmcp.asm` | DOS TSR source (8086 assembly) |
 | `dos-mcp/src/DOSMCP.COM` | Compiled DOS TSR binary |
-| `win-mcp/src/winmcp.c` | Win16 MCP source (C, ~2000 lines) |
+| `win-mcp/src/winmcp.c` | Win16 MCP source (C, approximately 3,000 lines) |
 | `win-mcp/src/WINMCP.EXE` | Compiled Win16 NE executable |
 | `win-mcp/src/WINMCHK.DLL` | Hook DLL for journal record/playback |
 | `lib/win-auto.js` | Node.js scripting library (Playwright-style API) |
@@ -34,7 +34,7 @@ A host-side scripting library (`lib/win-auto.js`) provides a Playwright-style as
 
 ```bash
 cd win-mcp/src && make        # Compile WINMCP.EXE
-cd win-mcp && make testwin    # Build + boot Win3.1 + run 75 tests
+cd win-mcp && make testwin    # Build + boot Win3.1 headlessly + run 111 tests
 ```
 
 ### DOS MCP
@@ -74,15 +74,18 @@ All in `tools/`:
 | `emu2` | emu2 DOS emulator | Patched for TSR support (headless testing) |
 | `win31-hdd/` | Minimal Win3.1 install | Used by DOSBox-X for `make testwin` (not in repo) |
 
-Source trees and patch files are in `patches/` — see `PATCHES.md` for build instructions.
+Patch material is in `patches/`; reconstruction helpers create source trees
+under `tools/`. See `PATCHES.md` for build instructions.
 
 ---
 
 ## Gotchas
 
-- **`make testwin` needs a display** — DOSBox-X boots a GUI window.
+- **`make testwin` is headless** — DOSBox-X uses SDL's dummy video driver.
+- **Direct `dosbox-run.sh` launches are visible by default** unless
+  `DOSBOX_HEADLESS=1` is set explicitly.
 - **`make test` (dos-mcp) is headless** — uses emu2, no display needed.
-- **`make testgui` (dos-mcp) needs 180s timeout** — DOSBox-X is slower than emu2 for 153 tests.
+- **`make testgui` (dos-mcp) needs 180s timeout** — DOSBox-X is slower than emu2 for 154 tests.
 - **emu2 patches are critical** — the stock emu2 binary cannot run TSR mode. Use the patched binary in `tools/emu2`.
 - **DOSBox-X control server** — enabled via `DOSBOX_CONTROL_PORT=10199` env var. See PATCHES.md.
 - **Port 139 requires sudo** if testing with the SMB share connected.

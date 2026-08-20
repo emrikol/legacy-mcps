@@ -13,6 +13,8 @@
 ; Reference: tsr/ref/ — dos-tsr-reentrancy.md, dos-tsr-guide.md,
 ;   dos-tsr-assembly-examples.md, 8086-errata-quirks.md
 
+%include "src/tool_build_identity.inc"
+
 CPU 8086                        ; Reject any 186+ instructions
 org 0x100                       ; .COM files load at CS:0100h
 
@@ -458,6 +460,13 @@ dispatch:
 dispatch_meta:
         mov     si, cmd_buf
         add     si, 5                   ; skip "META "
+        ; --- IDENTITY (8, before shorter commands) ---
+        mov     di, sub_identity
+        mov     cx, 8
+        call    str_ncmp_upper
+        jne     .m_not_identity
+        jmp     do_identity
+.m_not_identity:
         ; --- VERSION (7, before shorter V-prefix) ---
         mov     di, sub_version
         mov     cx, 7
@@ -2220,6 +2229,11 @@ do_outp:
 ; ============================================================
 do_version:
         mov     si, resp_version
+        call    write_rx
+        ret
+
+do_identity:
+        mov     si, resp_identity
         call    write_rx
         ret
 
@@ -11506,6 +11520,7 @@ fam_env:        db  'ENV '
 
 ; Subcommand strings (shared across families)
 sub_ping:       db  'PING'
+sub_identity:   db  'IDENTITY'
 sub_version:    db  'VERSION'
 sub_status:     db  'STATUS'
 sub_heartbeat:  db  'HEARTBEAT'
@@ -11631,11 +11646,14 @@ resp_err_chdir:     db  'ERR CHDIR_FAILED', 0
 resp_err_date:      db  'ERR INVALID_DATE', 0
 resp_err_time_inv:  db  'ERR INVALID_TIME', 0
 resp_err_notfound:  db  'ERR NOT_FOUND', 0
-resp_version:     db  'OK MCP/0.10 META,MEM,PORT,CON,GFX,SCREEN,MOUSE,KEY,'
+resp_version:     db  'OK MCP/0.11 META,MEM,PORT,CON,GFX,SCREEN,MOUSE,KEY,'
+                  db  'WAIT,FILE,DIR,DISK,EXEC,TIME,INI,CLIP,INT,ENV,SYS,CMOS,POWER,TSR', 0
+resp_identity:    db  'OK TOOL=DOSMCP PROTOCOL=0.11 BUILD=', DOSMCP_BUILD_ID
+                  db  ' FEATURES=META,MEM,PORT,CON,GFX,SCREEN,MOUSE,KEY,'
                   db  'WAIT,FILE,DIR,DISK,EXEC,TIME,INI,CLIP,INT,ENV,SYS,CMOS,POWER,TSR', 0
 
 ; STATUS format labels
-status_prefix:      db  'OK V0.10 CMDS=', 0
+status_prefix:      db  'OK V0.11 CMDS=', 0
 status_debug_lbl:   db  'DEBUG=', 0
 status_poll_lbl:    db  'POLL=', 0
 status_timeout_lbl: db  'TIMEOUT=', 0

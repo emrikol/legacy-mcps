@@ -1,0 +1,50 @@
+From 58a8d75142bbd3ce27f99a085c6df61b85f38cd8 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 19:00:20 -0400
+Subject: [PATCH 09/19] feat(control): expose reproducible build identity
+
+---
+ include/tool_build_identity.h     |  2 ++
+ src/gui/dosbox_control_server.cpp | 13 +++++++++++++
+ 2 files changed, 15 insertions(+)
+ create mode 100644 include/tool_build_identity.h
+
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+new file mode 100644
+index 0000000..6310863
+--- /dev/null
++++ b/include/tool_build_identity.h
+@@ -0,0 +1,2 @@
++/* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
++#define DOSBOX_X_BUILD_ID "6b6d714e7146e95cd5301a222e798a2e918b3a1adb34f4d0fcac0c29c07899d3"
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index 30c32bf..062a753 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -38,6 +38,7 @@
+ #include "keyboard.h"
+ #include "bios.h"
+ #include "debug.h"
++#include "tool_build_identity.h"
+ 
+ /* Externs */
+ extern Bitu CaptureState;
+@@ -136,6 +137,18 @@ static std::string handle_command(const std::string& cmd) {
+         return "OK PONG\n";
+     }
+ 
++    if (c == "IDENTITY") {
++        return "OK TOOL=DOSBOX-X PROTOCOL=CONTROL/1 BUILD="
++               DOSBOX_X_BUILD_ID
++               " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
++#if C_DEBUG
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,WAIT,CONTINUE"
++#else
++               " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
++#endif
++               "\n";
++    }
++
+     if (c == "STATUS") {
+         char buf[256];
+         snprintf(buf, sizeof(buf), "OK PROGRAM=%s CAPTURE_DIR=%s\n",

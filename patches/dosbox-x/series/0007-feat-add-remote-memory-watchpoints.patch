@@ -1,0 +1,548 @@
+From 41cebba19827bfef3378d456787a77f2616ed875 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 00:00:00 -0400
+Subject: [PATCH 07/19] feat: add remote memory watchpoints
+
+---
+ include/paging.h        | 109 +++++++++++++++++----
+ src/cpu/core_normal.cpp |   9 +-
+ src/debug/debug.cpp     | 207 +++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 303 insertions(+), 22 deletions(-)
+
+diff --git a/include/paging.h b/include/paging.h
+index e7e6974..94f470c 100644
+--- a/include/paging.h
++++ b/include/paging.h
+@@ -438,25 +438,69 @@ static INLINE PhysPt64 PAGING_GetPhysicalAddress64(const LinearPt linAddr) {
+ 
+ /* Special inlined memory reading/writing */
+ 
+-static INLINE uint8_t mem_readb_inline(const LinearPt address) {
++#if C_DEBUG
++void DEBUG_RemoteMemoryAccess(LinearPt address, unsigned int size,
++                              bool is_write, uint32_t value);
++#endif
++
++/* Instruction fetches use these raw helpers in the normal core. A debugger
++ * data-read watchpoint must not mistake opcode or immediate fetches for data
++ * accesses. */
++static INLINE uint8_t mem_readb_unwatched_inline(const LinearPt address) {
+ 	const HostPt tlb_addr=get_tlb_read(address);
+ 	if (tlb_addr) return host_readb(tlb_addr+address);
+ 	else return (uint8_t)(get_tlb_readhandler(address))->readb(address);
+ }
+ 
+-static INLINE uint16_t mem_readw_inline(const LinearPt address) {
++static INLINE uint16_t mem_readw_unwatched_inline(const LinearPt address) {
+ 	if ((address & 0xfff)<0xfff) {
+ 		const HostPt tlb_addr=get_tlb_read(address);
+ 		if (tlb_addr) return host_readw(tlb_addr+address);
+ 		else return (uint16_t)(get_tlb_readhandler(address))->readw(address);
+-	} else return mem_unalignedreadw(address);
++	} else return (uint16_t)(mem_readb_unwatched_inline(address) |
++	                        (uint16_t)(mem_readb_unwatched_inline(address+1u) << 8u));
+ }
+ 
+-static INLINE uint32_t mem_readd_inline(const LinearPt address) {
++static INLINE uint32_t mem_readd_unwatched_inline(const LinearPt address) {
+ 	if ((address & 0xfff)<0xffd) {
+ 		const HostPt tlb_addr=get_tlb_read(address);
+ 		if (tlb_addr) return host_readd(tlb_addr+address);
+ 		else return (uint32_t)(get_tlb_readhandler(address))->readd(address);
++	} else return (uint32_t)mem_readb_unwatched_inline(address) |
++	        ((uint32_t)mem_readb_unwatched_inline(address+1u) << 8u) |
++	        ((uint32_t)mem_readb_unwatched_inline(address+2u) << 16u) |
++	        ((uint32_t)mem_readb_unwatched_inline(address+3u) << 24u);
++}
++
++static INLINE uint8_t mem_readb_inline(const LinearPt address) {
++	const uint8_t value=mem_readb_unwatched_inline(address);
++#if C_DEBUG
++	DEBUG_RemoteMemoryAccess(address,1,false,value);
++#endif
++	return value;
++}
++
++static INLINE uint16_t mem_readw_inline(const LinearPt address) {
++	if ((address & 0xfff)<0xfff) {
++		const HostPt tlb_addr=get_tlb_read(address);
++		const uint16_t value=tlb_addr ? host_readw(tlb_addr+address) :
++		        (uint16_t)(get_tlb_readhandler(address))->readw(address);
++#if C_DEBUG
++		DEBUG_RemoteMemoryAccess(address,2,false,value);
++#endif
++		return value;
++	} else return mem_unalignedreadw(address);
++}
++
++static INLINE uint32_t mem_readd_inline(const LinearPt address) {
++	if ((address & 0xfff)<0xffd) {
++		const HostPt tlb_addr=get_tlb_read(address);
++		const uint32_t value=tlb_addr ? host_readd(tlb_addr+address) :
++		        (uint32_t)(get_tlb_readhandler(address))->readd(address);
++#if C_DEBUG
++		DEBUG_RemoteMemoryAccess(address,4,false,value);
++#endif
++		return value;
+ 	} else return mem_unalignedreadd(address);
+ }
+ 
+@@ -464,6 +508,9 @@ static INLINE void mem_writeb_inline(const LinearPt address,const uint8_t val) {
+ 	const HostPt tlb_addr=get_tlb_write(address);
+ 	if (tlb_addr) host_writeb(tlb_addr+address,val);
+ 	else (get_tlb_writehandler(address))->writeb(address,val);
++#if C_DEBUG
++	DEBUG_RemoteMemoryAccess(address,1,true,val);
++#endif
+ }
+ 
+ static INLINE void mem_writew_inline(const LinearPt address,const uint16_t val) {
+@@ -471,6 +518,9 @@ static INLINE void mem_writew_inline(const LinearPt address,const uint16_t val)
+ 		const HostPt tlb_addr=get_tlb_write(address);
+ 		if (tlb_addr) host_writew(tlb_addr+address,val);
+ 		else (get_tlb_writehandler(address))->writew(address,val);
++#if C_DEBUG
++		DEBUG_RemoteMemoryAccess(address,2,true,val);
++#endif
+ 	} else mem_unalignedwritew(address,val);
+ }
+ 
+@@ -479,63 +529,90 @@ static INLINE void mem_writed_inline(const LinearPt address,const uint32_t val)
+ 		const HostPt tlb_addr=get_tlb_write(address);
+ 		if (tlb_addr) host_writed(tlb_addr+address,val);
+ 		else (get_tlb_writehandler(address))->writed(address,val);
++#if C_DEBUG
++		DEBUG_RemoteMemoryAccess(address,4,true,val);
++#endif
+ 	} else mem_unalignedwrited(address,val);
+ }
+ 
+ 
+ static INLINE bool mem_readb_checked(const LinearPt address, uint8_t * const val) {
+ 	const HostPt tlb_addr=get_tlb_read(address);
++	bool failed=false;
+ 	if (tlb_addr) {
+ 		*val=host_readb(tlb_addr+address);
+-		return false;
+-	} else return (get_tlb_readhandler(address))->readb_checked(address, val);
++	} else failed=(get_tlb_readhandler(address))->readb_checked(address, val);
++#if C_DEBUG
++	if (!failed) DEBUG_RemoteMemoryAccess(address,1,false,*val);
++#endif
++	return failed;
+ }
+ 
+ static INLINE bool mem_readw_checked(const LinearPt address, uint16_t * const val) {
+ 	if ((address & 0xfffu)<0xfffu) {
+ 		const HostPt tlb_addr=get_tlb_read(address);
++		bool failed=false;
+ 		if (tlb_addr) {
+ 			*val=host_readw(tlb_addr+address);
+-			return false;
+-		} else return (get_tlb_readhandler(address))->readw_checked(address, val);
++		} else failed=(get_tlb_readhandler(address))->readw_checked(address, val);
++#if C_DEBUG
++		if (!failed) DEBUG_RemoteMemoryAccess(address,2,false,*val);
++#endif
++		return failed;
+ 	} else return mem_unalignedreadw_checked(address, val);
+ }
+ 
+ static INLINE bool mem_readd_checked(const LinearPt address, uint32_t * const val) {
+ 	if ((address & 0xfffu)<0xffdu) {
+ 		const HostPt tlb_addr=get_tlb_read(address);
++		bool failed=false;
+ 		if (tlb_addr) {
+ 			*val=host_readd(tlb_addr+address);
+-			return false;
+-		} else return (get_tlb_readhandler(address))->readd_checked(address, val);
++		} else failed=(get_tlb_readhandler(address))->readd_checked(address, val);
++#if C_DEBUG
++		if (!failed) DEBUG_RemoteMemoryAccess(address,4,false,*val);
++#endif
++		return failed;
+ 	} else return mem_unalignedreadd_checked(address, val);
+ }
+ 
+ static INLINE bool mem_writeb_checked(const LinearPt address,const uint8_t val) {
+ 	const HostPt tlb_addr=get_tlb_write(address);
++	bool failed=false;
+ 	if (tlb_addr) {
+ 		host_writeb(tlb_addr+address,val);
+-		return false;
+-	} else return (get_tlb_writehandler(address))->writeb_checked(address,val);
++	} else failed=(get_tlb_writehandler(address))->writeb_checked(address,val);
++#if C_DEBUG
++	if (!failed) DEBUG_RemoteMemoryAccess(address,1,true,val);
++#endif
++	return failed;
+ }
+ 
+ static INLINE bool mem_writew_checked(const LinearPt address,const uint16_t val) {
+ 	if ((address & 0xfffu)<0xfffu) {
+ 		const HostPt tlb_addr=get_tlb_write(address);
++		bool failed=false;
+ 		if (tlb_addr) {
+ 			host_writew(tlb_addr+address,val);
+-			return false;
+-		} else return (get_tlb_writehandler(address))->writew_checked(address,val);
++		} else failed=(get_tlb_writehandler(address))->writew_checked(address,val);
++#if C_DEBUG
++		if (!failed) DEBUG_RemoteMemoryAccess(address,2,true,val);
++#endif
++		return failed;
+ 	} else return mem_unalignedwritew_checked(address,val);
+ }
+ 
+ static INLINE bool mem_writed_checked(const LinearPt address,const uint32_t val) {
+ 	if ((address & 0xfffu)<0xffdu) {
+ 		const HostPt tlb_addr=get_tlb_write(address);
++		bool failed=false;
+ 		if (tlb_addr) {
+ 			host_writed(tlb_addr+address,val);
+-			return false;
+-		} else return (get_tlb_writehandler(address))->writed_checked(address,val);
++		} else failed=(get_tlb_writehandler(address))->writed_checked(address,val);
++#if C_DEBUG
++		if (!failed) DEBUG_RemoteMemoryAccess(address,4,true,val);
++#endif
++		return failed;
+ 	} else return mem_unalignedwrited_checked(address,val);
+ }
+ 
+diff --git a/src/cpu/core_normal.cpp b/src/cpu/core_normal.cpp
+index 8cfac53..3d4e601 100644
+--- a/src/cpu/core_normal.cpp
++++ b/src/cpu/core_normal.cpp
+@@ -124,23 +124,23 @@ static INLINE void FetchDiscardb() {
+ }
+ 
+ static INLINE uint8_t FetchPeekb() {
+-	uint8_t temp=LoadMb(core.cseip);
++	uint8_t temp=mem_readb_unwatched_inline(core.cseip);
+ 	return temp;
+ }
+ 
+ static INLINE uint8_t Fetchb() {
+-	uint8_t temp=LoadMb(core.cseip);
++	uint8_t temp=mem_readb_unwatched_inline(core.cseip);
+ 	core.cseip+=1;
+ 	return temp;
+ }
+ 
+ static INLINE uint16_t Fetchw() {
+-	uint16_t temp=LoadMw(core.cseip);
++	uint16_t temp=mem_readw_unwatched_inline(core.cseip);
+ 	core.cseip+=2;
+ 	return temp;
+ }
+ static INLINE uint32_t Fetchd() {
+-	uint32_t temp=LoadMd(core.cseip);
++	uint32_t temp=mem_readd_unwatched_inline(core.cseip);
+ 	core.cseip+=4;
+ 	return temp;
+ }
+@@ -240,4 +240,3 @@ Bits CPU_Core_Normal_Trap_Run(void) {
+ void CPU_Core_Normal_Init(void) {
+ 
+ }
+-
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index caa7932..4671895 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -343,6 +343,8 @@ static bool debug_running = false;
+ static std::atomic<bool> remote_debug_enabled(false);
+ static std::atomic<bool> remote_pause_requested(false);
+ static std::atomic<bool> remote_exception_pending(false);
++static std::atomic<bool> remote_watch_pending(false);
++static bool remote_watch_step_active = false;
+ static std::atomic<bool> remote_debug_stopped(false);
+ enum RemoteDebugStopReason {
+ 	REMOTE_STOP_NONE,
+@@ -353,7 +355,8 @@ enum RemoteDebugStopReason {
+ 	REMOTE_STOP_FINISH,
+ 	REMOTE_STOP_BREAKPOINT,
+ 	REMOTE_STOP_INTERRUPT,
+-	REMOTE_STOP_EXCEPTION
++	REMOTE_STOP_EXCEPTION,
++	REMOTE_STOP_WATCHPOINT
+ };
+ static std::atomic<int> remote_debug_stop_reason(REMOTE_STOP_NONE);
+ static std::atomic<unsigned int> remote_exception_vector(0);
+@@ -365,6 +368,33 @@ static std::string remote_debug_response;
+ static bool remote_debug_request_pending = false;
+ static bool remote_debug_response_ready = false;
+ 
++enum RemoteWatchMode {
++	REMOTE_WATCH_READ,
++	REMOTE_WATCH_WRITE,
++	REMOTE_WATCH_ACCESS,
++	REMOTE_WATCH_CHANGE
++};
++
++struct RemoteWatchpoint {
++	unsigned int id;
++	RemoteWatchMode mode;
++	uint32_t address;
++	uint32_t length;
++	bool once;
++	std::vector<uint8_t> baseline;
++};
++
++static std::vector<RemoteWatchpoint> remote_watchpoints;
++static unsigned int remote_next_watchpoint_id = 1;
++static unsigned int remote_watch_hit_id = 0;
++static uint32_t remote_watch_hit_address = 0;
++static unsigned int remote_watch_hit_size = 0;
++static uint32_t remote_watch_hit_value = 0;
++static bool remote_watch_hit_write = false;
++static uint16_t remote_watch_hit_cs = 0;
++static uint32_t remote_watch_hit_eip = 0;
++static CPU_Decoder *remote_watch_saved_decoder = NULL;
++
+ static const char *RemoteStopReasonName(void)
+ {
+ 	switch (remote_debug_stop_reason.load()) {
+@@ -376,9 +406,66 @@ static const char *RemoteStopReasonName(void)
+ 	case REMOTE_STOP_BREAKPOINT: return "BREAKPOINT";
+ 	case REMOTE_STOP_INTERRUPT: return "INTERRUPT";
+ 	case REMOTE_STOP_EXCEPTION: return "EXCEPTION";
++	case REMOTE_STOP_WATCHPOINT: return "WATCHPOINT";
+ 	default: return "NONE";
+ 	}
+ }
++
++static const char *RemoteWatchModeName(RemoteWatchMode mode)
++{
++	switch (mode) {
++	case REMOTE_WATCH_READ: return "READ";
++	case REMOTE_WATCH_WRITE: return "WRITE";
++	case REMOTE_WATCH_ACCESS: return "ACCESS";
++	case REMOTE_WATCH_CHANGE: return "CHANGE";
++	default: return "UNKNOWN";
++	}
++}
++
++/** Observe a completed CPU memory access. The normal core calls this from the
++ * paging fast path, while its instruction-fetch helpers deliberately bypass
++ * it so READ means data read rather than code execution. */
++void DEBUG_RemoteMemoryAccess(LinearPt address, unsigned int size,
++                              bool is_write, uint32_t value)
++{
++	if (remote_watchpoints.empty() ||
++	    (remote_debug_stopped.load() && !remote_watch_step_active)) return;
++	const uint64_t access_end = (uint64_t)address + size;
++	for (size_t index = 0; index < remote_watchpoints.size(); ++index) {
++		RemoteWatchpoint &watchpoint = remote_watchpoints[index];
++		const uint64_t watch_end = (uint64_t)watchpoint.address + watchpoint.length;
++		if (access_end <= watchpoint.address || address >= watch_end) continue;
++
++		bool matches = watchpoint.mode == REMOTE_WATCH_ACCESS ||
++		               (watchpoint.mode == REMOTE_WATCH_READ && !is_write) ||
++		               (watchpoint.mode == REMOTE_WATCH_WRITE && is_write);
++		if (watchpoint.mode == REMOTE_WATCH_CHANGE && is_write) {
++			for (unsigned int byte = 0; byte < size; ++byte) {
++				const uint64_t byte_address = (uint64_t)address + byte;
++				if (byte_address < watchpoint.address || byte_address >= watch_end) continue;
++				const size_t baseline_index =
++				        static_cast<size_t>(byte_address - watchpoint.address);
++				const uint8_t new_value = static_cast<uint8_t>(value >> (byte * 8U));
++				if (watchpoint.baseline[baseline_index] != new_value) matches = true;
++				watchpoint.baseline[baseline_index] = new_value;
++			}
++		}
++		if (!matches || remote_watch_pending.load()) continue;
++
++		remote_watch_hit_id = watchpoint.id;
++		remote_watch_hit_address = address;
++		remote_watch_hit_size = size;
++		remote_watch_hit_value = value;
++		remote_watch_hit_write = is_write;
++		remote_watch_hit_cs = SegValue(cs);
++		remote_watch_hit_eip = reg_eip;
++		remote_debug_stop_reason.store(REMOTE_STOP_WATCHPOINT);
++		remote_watch_pending.store(true);
++		CPU_Cycles = 0;
++		if (watchpoint.once) remote_watchpoints.erase(remote_watchpoints.begin() + index);
++		return;
++	}
++}
+ static bool check_rescroll = false;
+ 
+ static FPU_rec oldfpu;
+@@ -4749,6 +4836,14 @@ static std::string RemoteRegisterState(void)
+ 	if (remote_debug_stop_reason.load() == REMOTE_STOP_EXCEPTION)
+ 		out << " EXCEPTION=" << std::setw(2) << remote_exception_vector.load()
+ 		    << " ERROR=" << std::setw(8) << remote_exception_error.load();
++	if (remote_debug_stop_reason.load() == REMOTE_STOP_WATCHPOINT)
++		out << " WATCH=" << std::dec << remote_watch_hit_id << std::hex
++		    << " ACCESS=" << (remote_watch_hit_write ? "WRITE" : "READ")
++		    << " ADDRESS=" << std::setw(8) << remote_watch_hit_address
++		    << " SIZE=" << std::dec << remote_watch_hit_size << std::hex
++		    << " VALUE=" << std::setw(8) << remote_watch_hit_value
++		    << " AT=" << std::setw(4) << remote_watch_hit_cs << ":"
++		    << std::setw(8) << remote_watch_hit_eip;
+ 	return out.str();
+ }
+ 
+@@ -4875,7 +4970,9 @@ static void RemoteStepOneInstruction(bool inhibit_events = false)
+ 	mustCompleteInstruction = true;
+ 	inhibit_int_breakpoint = inhibit_events;
+ 	inhibit_exception_breakpoint = inhibit_events;
++	remote_watch_step_active = true;
+ 	DEBUG_Run(1, true);
++	remote_watch_step_active = false;
+ 	inhibit_exception_breakpoint = false;
+ 	inhibit_int_breakpoint = false;
+ 	mustCompleteInstruction = false;
+@@ -5148,6 +5245,98 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		return "OK ADDED";
+ 	}
+ 
++	if (command == "WATCH") {
++		std::string action;
++		input >> action;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "LIST") {
++			std::string extra;
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG WATCH LIST";
++			if (remote_watchpoints.empty()) return "OK EMPTY";
++			std::ostringstream out;
++			out << "OK" << std::hex << std::uppercase << std::setfill('0');
++			for (const auto &watchpoint : remote_watchpoints)
++				out << " " << std::dec << watchpoint.id << ":"
++				    << RemoteWatchModeName(watchpoint.mode) << ":"
++				    << std::hex << std::setw(8) << watchpoint.address << ":"
++				    << std::setw(8) << watchpoint.length
++				    << (watchpoint.once ? ":ONCE" : "");
++			return out.str();
++		}
++		if (action == "CLEAR") {
++			std::string extra;
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG WATCH CLEAR";
++			remote_watchpoints.clear();
++			return "OK CLEARED";
++		}
++		if (action == "DELETE") {
++			std::string id_text, extra;
++			input >> id_text >> extra;
++			char *end = NULL;
++			const unsigned long id = strtoul(id_text.c_str(), &end, 10);
++			if (id_text.empty() || !end || *end != '\0' || !id || !extra.empty())
++				return "ERR USAGE DEBUG WATCH DELETE <decimal-id>";
++			for (auto iterator = remote_watchpoints.begin();
++			     iterator != remote_watchpoints.end(); ++iterator) {
++				if (iterator->id == id) {
++					remote_watchpoints.erase(iterator);
++					return "OK DELETED";
++				}
++			}
++			return "ERR NOT_FOUND";
++		}
++		if (action == "ADD") {
++			std::string mode_text, address_text, length_text, option, extra;
++			input >> mode_text >> address_text >> length_text >> option >> extra;
++			for (auto &ch : mode_text) ch = static_cast<char>(toupper(ch));
++			for (auto &ch : option) ch = static_cast<char>(toupper(ch));
++			RemoteWatchMode mode;
++			if (mode_text == "READ") mode = REMOTE_WATCH_READ;
++			else if (mode_text == "WRITE") mode = REMOTE_WATCH_WRITE;
++			else if (mode_text == "ACCESS") mode = REMOTE_WATCH_ACCESS;
++			else if (mode_text == "CHANGE") mode = REMOTE_WATCH_CHANGE;
++			else return "ERR INVALID_WATCH_MODE";
++			uint16_t segment = 0;
++			uint32_t offset = 0;
++			uint32_t length = 0;
++			if (!RemoteParseAddress(address_text, segment, offset))
++				return "ERR INVALID_ADDRESS";
++			if (!RemoteParseHex(length_text, length) || !length || length > 512U)
++				return "ERR WATCH_LENGTH_RANGE_1_200";
++			if (offset > 0xffffffffU - (length - 1U)) return "ERR INVALID_ADDRESS";
++			const uint64_t first = GetAddress(segment, offset);
++			const uint64_t last = GetAddress(segment, offset + length - 1U);
++			if (first == mem_no_address || last == mem_no_address ||
++			    last != first + length - 1U || first > 0xffffffffU)
++				return "ERR INVALID_ADDRESS";
++			const bool once = option == "ONCE";
++			if ((!option.empty() && !once) || !extra.empty())
++				return "ERR USAGE DEBUG WATCH ADD <READ|WRITE|ACCESS|CHANGE> <selector:offset> <hex-length> [ONCE]";
++			RemoteWatchpoint watchpoint;
++			watchpoint.id = remote_next_watchpoint_id++;
++			watchpoint.mode = mode;
++			watchpoint.address = static_cast<uint32_t>(first);
++			watchpoint.length = length;
++			watchpoint.once = once;
++			watchpoint.baseline.resize(length);
++			for (uint32_t index = 0; index < length; ++index) {
++				if (mem_readb_checked(static_cast<PhysPt>(first + index),
++				                      &watchpoint.baseline[index]))
++					return "ERR MEMORY_READ";
++			}
++			remote_watchpoints.push_back(watchpoint);
++			remote_debug_enabled.store(true);
++			std::ostringstream out;
++			out << "OK ADDED ID=" << watchpoint.id << " LINEAR=" << std::hex
++			    << std::uppercase << std::setfill('0') << std::setw(8)
++			    << watchpoint.address;
++			return out.str();
++		}
++		return "ERR USAGE DEBUG WATCH (ADD|DELETE|LIST|CLEAR)";
++	}
++
+ 	if (command == "BREAK") {
+ 		std::string action, address_text;
+ 		input >> action >> address_text;
+@@ -5221,6 +5410,8 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		}
+ 		for (uint32_t i = 0; i < count; ++i) {
+ 			RemoteStepOneInstruction();
++			if (remote_debug_stop_reason.load() == REMOTE_STOP_WATCHPOINT)
++				return RemoteRegisterState();
+ 		}
+ 		remote_debug_stop_reason.store(REMOTE_STOP_STEP);
+ 		return RemoteRegisterState();
+@@ -5254,6 +5445,8 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 
+ 			if (enters_frame) ++nested_depth;
+ 			RemoteStepOneInstruction();
++			if (remote_debug_stop_reason.load() == REMOTE_STOP_WATCHPOINT)
++				return RemoteRegisterState();
+ 			if (leaves_frame) {
+ 				if (nested_depth == 0) {
+ 					remote_debug_stop_reason.store(REMOTE_STOP_FINISH);
+@@ -5311,6 +5504,10 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		        static_cast<PhysPt>(GetAddress(SegValue(cs), reg_eip)));
+ 		RemoteStepOneInstruction(resuming_event);
+ 		CBreakpoint::ActivateBreakpoints();
++		if (!remote_watchpoints.empty() && cpudecoder != &CPU_Core_Normal_Run) {
++			remote_watch_saved_decoder = cpudecoder;
++			cpudecoder = &CPU_Core_Normal_Run;
++		}
+ 		DOSBOX_SetNormalLoop();
+ 		resume = true;
+ 		return "OK RUNNING";
+@@ -5321,6 +5518,10 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 
+ static Bitu RemoteDebuggerLoop(void)
+ {
++	if (remote_watch_saved_decoder) {
++		cpudecoder = remote_watch_saved_decoder;
++		remote_watch_saved_decoder = NULL;
++	}
+ 	CBreakpoint::DeactivateBreakpoints();
+ 	{
+ 		std::lock_guard<std::mutex> lock(remote_debug_mutex);
+@@ -7119,6 +7320,10 @@ void DEBUG_HeavyWriteLogInstruction(void) {
+ }
+ 
+ bool DEBUG_HeavyIsBreakpoint(void) {
++	if (remote_watch_pending.exchange(false)) {
++		remote_debug_enabled.store(true);
++		return true;
++	}
+ 	if (remote_exception_pending.exchange(false)) {
+ 		remote_debug_enabled.store(true);
+ 		return true;

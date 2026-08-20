@@ -18,7 +18,7 @@ var SHARE_DIR = path.resolve(__dirname, '..', 'share');
 var MAGIC_DIR = path.join(SHARE_DIR, '_MAGIC_');
 
 // WinAuto instance for IPC
-var auto = new WinAuto({ magicDir: MAGIC_DIR, pollMs: 200, timeout: 10000 });
+var auto = new WinAuto({ magicDir: MAGIC_DIR, pollMs: 25, timeout: 10000 });
 
 // IPC is handled by win-auto.js (auto instance created above)
 
@@ -27,7 +27,10 @@ var TIMEOUT_SEC = parseInt(
   process.argv.find(function (a, i) { return process.argv[i - 1] === '--timeout'; }) || '60',
   10
 );
-var POLL_MS = 200;
+var READY_TIMEOUT_SEC = parseInt(
+  process.argv.find(function (a, i) { return process.argv[i - 1] === '--ready-timeout'; }) || '15',
+  10
+);
 var MAX_RETRIES = 3;
 
 // Dynamic variable store — tests can capture values from responses
@@ -50,9 +53,49 @@ var tests = [
     expectPattern: /^OK WINMCP\/0\.\d+.*META.*TYPE.*SENDKEYS.*MOUSE.*WAIT.*RECORD.*PLAY/,
   },
   {
+    name: 'META IDENTITY',
+    command: 'META IDENTITY',
+    expectPattern: /^OK TOOL=WINMCP PROTOCOL=0\.9 BUILD=[0-9a-f]{64} FEATURES=.*META.*HEAP.*MEMORY.*RECORD.*PLAY.*CONTROL_FINDID$/,
+  },
+  {
     name: 'META STATUS',
     command: 'META STATUS',
     expectPattern: /^OK CMDS=\d+ POLL=\d+ms$/,
+  },
+  {
+    name: 'HEAP SUMMARY',
+    command: 'HEAP SUMMARY',
+    expectPattern: /^OK GLOBAL=\d+ .*USER_HEAP=[0-9A-F]{4} GDI_HEAP=[0-9A-F]{4}$/,
+  },
+  {
+    name: 'MODULE PROC resolves USER SendMessage',
+    command: 'MODULE PROC USER SENDMESSAGE',
+    expectPattern: /^OK MODULE=USER PROC=SENDMESSAGE ADDRESS=[0-9A-F]{4}:[0-9A-F]{4}$/,
+  },
+  {
+    name: 'MODULE PROC missing export fails closed',
+    command: 'MODULE PROC USER DEFINITELY_NOT_AN_EXPORT',
+    expect: 'ERR PROC_NOT_FOUND',
+  },
+  {
+    name: 'MODULE PROC rejects an overflowing ordinal',
+    command: 'MODULE PROC USER #65536',
+    expect: 'ERR INVALID_ORDINAL',
+  },
+  {
+    name: 'HEAP GLOBAL first page',
+    command: 'HEAP GLOBAL 0 2',
+    expectPattern: /^OK START=0(?: ENTRY=\d+,HANDLE=[0-9A-F]{4}.*)? NEXT=\d+$/,
+  },
+  {
+    name: 'HEAP HANDLE invalid fails closed',
+    command: 'HEAP HANDLE 0000',
+    expect: 'ERR SYNTAX',
+  },
+  {
+    name: 'HEAP LOCAL invalid fails closed',
+    command: 'HEAP LOCAL FFFE 0 2',
+    expectPattern: /^ERR (INVALID_HANDLE|NO_LOCAL_HEAP)$/,
   },
 
   // === PROFILE ===
@@ -220,6 +263,58 @@ var tests = [
     command: 'TASK LIST',
     expectPattern: /^OK .*NOTEPAD.*WINMCP/,
   },
+  {
+    name: 'TASK INFO by module',
+    command: 'TASK INFO NOTEPAD',
+    expectPattern: /^OK TASK=[0-9A-F]{4} MODULE=NOTEPAD .*SS:SP=[0-9A-F]{4}:[0-9A-F]{4}/,
+  },
+  {
+    name: 'TASK CSIP by module',
+    command: 'TASK CSIP NOTEPAD',
+    expectPattern: /^OK TASK=[0-9A-F]{4} CS:IP=[0-9A-F]{4}:[0-9A-F]{4}$/,
+  },
+  {
+    name: 'TASK STACK by module',
+    command: 'TASK STACK NOTEPAD',
+    expectPattern: /^OK(?: #\d+=[0-9A-F]{4}:[0-9A-F]{4}.*)?$/,
+  },
+
+  // === MODULE / MEMORY INSPECTION ===
+  {
+    name: 'MODULE LIST',
+    command: 'MODULE LIST',
+    expectPattern: /^OK (?=.*NOTEPAD)(?=.*WINMCP)/,
+  },
+  {
+    name: 'MODULE INFO',
+    command: 'MODULE INFO NOTEPAD',
+    expectPattern: /^OK MODULE=NOTEPAD HMODULE=[0-9A-F]{4} USAGE=\d+ PATH=.+/,
+  },
+  {
+    name: 'MODULE SEGMENTS (capture selector)',
+    command: 'MODULE SEGMENTS NOTEPAD',
+    expectPattern: /^OK MODULE=NOTEPAD START=1 SEG=1 SEL=[0-9A-F]{4} .*SIZE=[0-9A-F]{8}.* NEXT=\d+$/,
+    capture: { pattern: /SEG=1 SEL=([0-9A-F]{4})/, as: 'notepadSelector' },
+  },
+  {
+    name: 'MEMORY READ protected-mode selector',
+    command: 'MEMORY READ {{notepadSelector}}:0000 16',
+    requireVar: 'notepadSelector',
+    expectPattern: /^OK [0-9A-F]{4}:00000000 N=16(?: [0-9A-F]{2}){16}$/,
+    capture: { pattern: /N=16 ([0-9A-F]{2})/, as: 'notepadFirstByte' },
+  },
+  {
+    name: 'MEMORY WRITE verified no-op',
+    command: 'MEMORY WRITE UNSAFE {{notepadSelector}}:0000 {{notepadFirstByte}}',
+    requireVar: 'notepadFirstByte',
+    expectPattern: /^OK MUTATED=1 [0-9A-F]{4}:00000000 N=1 BEFORE=[0-9A-F]{2} AFTER=[0-9A-F]{2}$/,
+  },
+  {
+    name: 'MEMORY READ enforces bound',
+    command: 'MEMORY READ {{notepadSelector}}:0000 513',
+    requireVar: 'notepadSelector',
+    expect: 'ERR RANGE MAX=512',
+  },
 
   // === GDI ===
   {
@@ -339,6 +434,18 @@ var tests = [
     expectPattern: /^OK .+Button.+/,
   },
   {
+    name: 'DIALOG: resolve filename field by control ID without text',
+    command: 'CONTROL FINDID {{saveAsHwnd}} 1152',
+    requireVar: 'saveAsHwnd',
+    expectPattern: /^OK [0-9A-F]{4}$/,
+  },
+  {
+    name: 'DIALOG: reject missing control ID',
+    command: 'CONTROL FINDID {{saveAsHwnd}} 32767',
+    requireVar: 'saveAsHwnd',
+    expect: 'ERR NOT_FOUND',
+  },
+  {
     name: 'DIALOG: get filename field (id 1152)',
     command: 'DIALOG GET {{saveAsHwnd}} 1152',
     requireVar: 'saveAsHwnd',
@@ -346,7 +453,7 @@ var tests = [
   },
   {
     name: 'DIALOG: set filename',
-    command: 'DIALOG SET {{saveAsHwnd}} 1152 MCPTEST.TXT',
+    command: 'DIALOG SET {{saveAsHwnd}} 1152 MCPTEST',
     requireVar: 'saveAsHwnd',
     expect: 'OK',
   },
@@ -354,7 +461,13 @@ var tests = [
     name: 'DIALOG: verify filename was set',
     command: 'DIALOG GET {{saveAsHwnd}} 1152',
     requireVar: 'saveAsHwnd',
-    expect: 'OK MCPTEST.TXT',
+    expect: 'OK MCPTEST',
+  },
+  {
+    name: 'DIALOG: dispatch typed text to control',
+    command: 'DIALOG TYPE {{saveAsHwnd}} 1152 X',
+    requireVar: 'saveAsHwnd',
+    expect: 'OK',
   },
   {
     name: 'DIALOG: click Cancel (id 2)',
@@ -768,8 +881,10 @@ async function runTest(test) {
 }
 
 async function main() {
+  var suiteStartedAt = Date.now();
   console.log('WIN-MCP Test Harness');
   console.log('Timeout: ' + TIMEOUT_SEC + 's');
+  console.log('READY timeout: ' + READY_TIMEOUT_SEC + 's');
   console.log('');
 
   ensureMagicDir();
@@ -782,15 +897,17 @@ async function main() {
   }, TIMEOUT_SEC * 1000);
 
   console.log('Waiting for WIN-MCP to signal READY...');
+  var readyStartedAt = Date.now();
   try {
-    await auto.waitForReady(30000);
+    await auto.waitForReady(READY_TIMEOUT_SEC * 1000);
   } catch (e) {
     console.log('FAIL: WIN-MCP never became READY');
     clearTimeout(globalTimeout);
     process.exit(2);
   }
 
-  console.log('WIN-MCP is READY. Running tests...\n');
+  console.log('WIN-MCP is READY after ' +
+    ((Date.now() - readyStartedAt) / 1000).toFixed(2) + 's. Running tests...\n');
 
   for (var i = 0; i < tests.length; i++) {
     if (timedOut) break;
@@ -802,7 +919,8 @@ async function main() {
     auto.send('META QUIT', 2000).catch(function() {});
   } catch (_) {}
 
-  console.log('\nResults: ' + passed + ' passed, ' + failed + ' failed out of ' + tests.length + ' tests');
+  console.log('\nResults: ' + passed + ' passed, ' + failed + ' failed out of ' + tests.length +
+    ' tests in ' + ((Date.now() - suiteStartedAt) / 1000).toFixed(2) + 's');
 
   clearTimeout(globalTimeout);
   // Wait a moment for QUIT to process, then cleanup

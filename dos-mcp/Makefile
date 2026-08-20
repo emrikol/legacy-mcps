@@ -16,6 +16,9 @@ AFLAGS   = -f bin -Wall -Werror -Wno-reloc-abs-word -Wno-zeroing
 SRCDIR   = src
 SRC      = $(SRCDIR)/dosmcp.asm
 OUT      = $(SRCDIR)/DOSMCP.COM
+IDENTITY = $(SRCDIR)/tool_build_identity.inc
+IDENTITY_SCRIPT = ../scripts/update-guest-tool-identities.js
+IDENTITY_CONTRACT = ../scripts/guest-tool-source-contract.json
 SHARE    = ../share
 TOOLS    = ../tools
 EMU2     = $(TOOLS)/emu2
@@ -28,7 +31,10 @@ DBCONF   = dosbox-test.conf
 
 all: $(OUT)
 
-$(OUT): $(SRC)
+$(IDENTITY): $(SRC) Makefile $(IDENTITY_SCRIPT) $(IDENTITY_CONTRACT)
+	node $(IDENTITY_SCRIPT)
+
+$(OUT): $(SRC) $(IDENTITY)
 	$(ASM) $(AFLAGS) -o $(OUT) $(SRC)
 	@echo "Built $(OUT) - $$(wc -c < $(OUT)) bytes"
 

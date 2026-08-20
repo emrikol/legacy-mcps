@@ -26,6 +26,9 @@ EXE_OUT  = WINMCP.EXE
 DLL_SRC  = winmchk.c
 DLL_OBJ  = winmchk.obj
 DLL_OUT  = WINMCHK.DLL
+IDENTITY = tool_build_identity.h
+IDENTITY_SCRIPT = ../../scripts/update-guest-tool-identities.js
+IDENTITY_CONTRACT = ../../scripts/guest-tool-source-contract.json
 
 # Where to deploy
 SHARE    = ../../share
@@ -35,7 +38,10 @@ HDD      = ../../tools/win31-hdd
 
 all: $(EXE_OUT) $(DLL_OUT)
 
-$(EXE_OBJ): $(EXE_SRC)
+$(IDENTITY): $(EXE_SRC) $(DLL_SRC) Makefile $(IDENTITY_SCRIPT) $(IDENTITY_CONTRACT)
+	node $(IDENTITY_SCRIPT)
+
+$(EXE_OBJ): $(EXE_SRC) $(IDENTITY)
 	WATCOM=$(WATCOM) $(CC) $(CFLAGS) -fo=$(EXE_OBJ) $(EXE_SRC)
 
 $(EXE_OUT): $(EXE_OBJ)
@@ -51,10 +57,10 @@ $(EXE_OUT): $(EXE_OBJ)
 		export WndProc.1
 
 # DLL: -bd flag tells Watcom to generate DLL prolog/epilog
-$(DLL_OBJ): $(DLL_SRC)
+$(DLL_OBJ): $(DLL_SRC) Makefile
 	WATCOM=$(WATCOM) $(CC) $(CFLAGS) -bd -fo=$(DLL_OBJ) $(DLL_SRC)
 
-$(DLL_OUT): $(DLL_OBJ)
+$(DLL_OUT): $(DLL_OBJ) Makefile
 	WATCOM=$(WATCOM) PATH="$(BINDIR):$$PATH" $(LINK) \
 		system windows_dll \
 		name $(DLL_OUT) \

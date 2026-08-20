@@ -1,0 +1,308 @@
+From d823071b7000e1d284a8bb43eb17369d49c7e1b2 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 20:51:57 -0400
+Subject: [PATCH 12/19] feat(debugger): trace Win16 API entrypoints
+
+---
+ include/tool_build_identity.h     |   2 +-
+ src/debug/debug.cpp               | 216 ++++++++++++++++++++++++++++++
+ src/gui/dosbox_control_server.cpp |   2 +-
+ 3 files changed, 218 insertions(+), 2 deletions(-)
+
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+index 0005f6f..aaaa7b0 100644
+--- a/include/tool_build_identity.h
++++ b/include/tool_build_identity.h
+@@ -1,2 +1,2 @@
+ /* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
+-#define DOSBOX_X_BUILD_ID "2f3ebedaf395229082821cfeb1d0214a1c4409a1876c4822fdf75458b46f9142"
++#define DOSBOX_X_BUILD_ID "a5a3f83d4816e312f59c148d694fdca08bc15f5c40c2089357808265c6a1f877"
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index b07d071..c37a416 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -461,6 +461,35 @@ static uint64_t remote_fileio_dropped = 0;
+ static std::deque<RemoteFileIoEvent> remote_fileio_events;
+ static std::map<uint32_t, uint64_t> remote_fileio_offsets;
+ 
++/* A bounded, non-stopping probe records entry stack bytes at exact protected-
++ * mode addresses. Host plans attach Win16 message/API meaning; the emulator
++ * deliberately knows nothing about USER/GDI calling conventions. */
++struct RemoteApiTraceProbe {
++	unsigned int id;
++	uint16_t selector;
++	uint32_t offset;
++	uint32_t stack_bytes;
++};
++
++struct RemoteApiTraceEvent {
++	uint64_t sequence;
++	unsigned int probe_id;
++	uint16_t cs;
++	uint32_t eip;
++	uint16_t ss;
++	uint32_t esp;
++	bool stack_valid;
++	std::vector<uint8_t> stack;
++};
++
++static bool remote_api_trace_active = false;
++static size_t remote_api_trace_capacity = 256;
++static uint64_t remote_api_trace_next_sequence = 0;
++static uint64_t remote_api_trace_dropped = 0;
++static std::vector<RemoteApiTraceProbe> remote_api_trace_probes;
++static std::deque<RemoteApiTraceEvent> remote_api_trace_events;
++static CPU_Decoder *remote_api_trace_saved_decoder = NULL;
++
+ static const char *RemoteFileIoOperationName(DEBUG_FileIoOperation operation)
+ {
+ 	switch (operation) {
+@@ -5320,6 +5349,70 @@ static std::string RemoteFileIoDrain(size_t count)
+ 	return out.str();
+ }
+ 
++static std::string RemoteApiTraceStatus(void)
++{
++	std::ostringstream out;
++	out << "OK ACTIVE=" << (remote_api_trace_active ? 1 : 0)
++	    << " CAPACITY=" << remote_api_trace_capacity
++	    << " PROBES=" << remote_api_trace_probes.size()
++	    << " QUEUED=" << remote_api_trace_events.size()
++	    << " DROPPED=" << remote_api_trace_dropped
++	    << " NEXT=" << remote_api_trace_next_sequence;
++	return out.str();
++}
++
++static std::string RemoteApiTraceDrain(size_t count)
++{
++	const size_t drained = std::min(count, remote_api_trace_events.size());
++	std::ostringstream out;
++	out << "OK COUNT=" << drained
++	    << " ACTIVE=" << (remote_api_trace_active ? 1 : 0)
++	    << " DROPPED=" << remote_api_trace_dropped;
++	for (size_t index = 0; index < drained; ++index) {
++		const RemoteApiTraceEvent &event = remote_api_trace_events.front();
++		out << "\nSEQ=" << event.sequence
++		    << " ID=" << event.probe_id
++		    << " SITE=" << std::hex << std::uppercase << std::setfill('0')
++		    << std::setw(4) << event.cs << ":" << std::setw(8) << event.eip
++		    << " STACK=" << std::setw(4) << event.ss << ":"
++		    << std::setw(8) << event.esp
++		    << " VALID=" << (event.stack_valid ? 1 : 0)
++		    << " BYTES=";
++		if (!event.stack_valid || event.stack.empty()) out << "-";
++		else {
++			for (const auto byte : event.stack)
++				out << std::setw(2) << static_cast<unsigned int>(byte);
++		}
++		out << std::dec;
++		remote_api_trace_events.pop_front();
++	}
++	return out.str();
++}
++
++static bool RemoteApiTraceParseProbe(const std::string &text,
++	                                  RemoteApiTraceProbe &probe)
++{
++	const size_t first = text.find(':');
++	const size_t second = first == std::string::npos ? first : text.find(':', first + 1U);
++	const size_t third = second == std::string::npos ? second : text.find(':', second + 1U);
++	if (first == std::string::npos || second == std::string::npos ||
++	    third == std::string::npos || text.find(':', third + 1U) != std::string::npos)
++		return false;
++	uint32_t id = 0, selector = 0, offset = 0, stack_bytes = 0;
++	if (!RemoteParseHex(text.substr(0, first), id) || !id || id > 0xffffU ||
++	    !RemoteParseHex(text.substr(first + 1U, second - first - 1U), selector) ||
++	    selector > 0xffffU ||
++	    !RemoteParseHex(text.substr(second + 1U, third - second - 1U), offset) ||
++	    !RemoteParseHex(text.substr(third + 1U), stack_bytes) || !stack_bytes ||
++	    stack_bytes > 64U)
++		return false;
++	probe.id = static_cast<unsigned int>(id);
++	probe.selector = static_cast<uint16_t>(selector);
++	probe.offset = offset;
++	probe.stack_bytes = stack_bytes;
++	return true;
++}
++
+ static bool RemoteReadSelectorWord(uint16_t selector, uint32_t offset,
+                                    uint16_t &value)
+ {
+@@ -5331,6 +5424,38 @@ static bool RemoteReadSelectorWord(uint16_t selector, uint32_t offset,
+ 	return !mem_readw_checked(static_cast<PhysPt>(first), &value);
+ }
+ 
++static void RemoteApiTraceObserve(void)
++{
++	if (!remote_api_trace_active) return;
++	for (const auto &probe : remote_api_trace_probes) {
++		if (probe.selector != SegValue(cs) || probe.offset != reg_eip) continue;
++		RemoteApiTraceEvent event;
++		event.sequence = remote_api_trace_next_sequence++;
++		event.probe_id = probe.id;
++		event.cs = SegValue(cs);
++		event.eip = reg_eip;
++		event.ss = SegValue(ss);
++		event.esp = cpu.stack.big ? reg_esp : (reg_esp & 0xffffU);
++		event.stack_valid = event.esp <= UINT32_MAX - (probe.stack_bytes - 1U);
++		event.stack.resize(probe.stack_bytes);
++		for (uint32_t index = 0; event.stack_valid && index < probe.stack_bytes; ++index) {
++			const uint64_t address = GetAddress(event.ss, event.esp + index);
++			if (address == mem_no_address ||
++			    mem_readb_checked(static_cast<PhysPt>(address), &event.stack[index])) {
++				event.stack_valid = false;
++				event.stack.clear();
++				break;
++			}
++		}
++		if (!event.stack_valid) event.stack.clear();
++		if (remote_api_trace_events.size() >= remote_api_trace_capacity) {
++			++remote_api_trace_dropped;
++			continue;
++		}
++		remote_api_trace_events.push_back(event);
++	}
++}
++
+ static std::string RemoteWin16Stack(uint32_t count)
+ {
+ 	if (!count || count > 64U) return "ERR STACK_COUNT_RANGE_1_64";
+@@ -5808,6 +5933,86 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		return "ERR USAGE DEBUG FILEIO (START|STATUS|DRAIN|STOP|CLEAR)";
+ 	}
+ 
++	if (command == "APITRACE") {
++		std::string action;
++		input >> action;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "STATUS") {
++			std::string extra;
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG APITRACE STATUS";
++			return RemoteApiTraceStatus();
++		}
++		if (action == "START") {
++			if (!remote_watchpoints.empty())
++				return "ERR APITRACE_INCOMPATIBLE_WITH_WATCHPOINTS";
++			std::string capacity_text;
++			input >> capacity_text;
++			char *end = NULL;
++			const unsigned long capacity = strtoul(capacity_text.c_str(), &end, 10);
++			if (capacity_text.empty() || !end || *end != '\0' ||
++			    capacity < 16UL || capacity > 8192UL)
++				return "ERR APITRACE_CAPACITY_RANGE_16_8192";
++			std::vector<RemoteApiTraceProbe> probes;
++			std::set<unsigned int> ids;
++			std::set<std::pair<uint16_t, uint32_t> > addresses;
++			std::string token;
++			while (input >> token) {
++				RemoteApiTraceProbe probe;
++				if (!RemoteApiTraceParseProbe(token, probe))
++					return "ERR APITRACE_PROBE ID:SELECTOR:OFFSET:STACK_BYTES_HEX";
++				if (!ids.insert(probe.id).second)
++					return "ERR APITRACE_DUPLICATE_ID";
++				if (!addresses.insert(std::make_pair(probe.selector, probe.offset)).second)
++					return "ERR APITRACE_DUPLICATE_ADDRESS";
++				if (GetAddress(probe.selector, probe.offset) == mem_no_address)
++					return "ERR APITRACE_INVALID_ADDRESS";
++				probes.push_back(probe);
++				if (probes.size() > 32U) return "ERR APITRACE_PROBE_COUNT_RANGE_1_32";
++			}
++			if (probes.empty()) return "ERR APITRACE_PROBE_COUNT_RANGE_1_32";
++			remote_api_trace_active = false;
++			remote_api_trace_events.clear();
++			remote_api_trace_probes = probes;
++			remote_api_trace_capacity = static_cast<size_t>(capacity);
++			remote_api_trace_next_sequence = 0;
++			remote_api_trace_dropped = 0;
++			remote_api_trace_active = true;
++			return RemoteApiTraceStatus();
++		}
++		if (action == "STOP") {
++			std::string extra;
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG APITRACE STOP";
++			remote_api_trace_active = false;
++			return RemoteApiTraceStatus();
++		}
++		if (action == "CLEAR") {
++			std::string extra;
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG APITRACE CLEAR";
++			remote_api_trace_events.clear();
++			remote_api_trace_next_sequence = 0;
++			remote_api_trace_dropped = 0;
++			return RemoteApiTraceStatus();
++		}
++		if (action == "DRAIN") {
++			std::string count_text, extra;
++			input >> count_text >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG APITRACE DRAIN [count]";
++			size_t count = 8;
++			if (!count_text.empty()) {
++				char *end = NULL;
++				const unsigned long parsed = strtoul(count_text.c_str(), &end, 10);
++				if (!end || *end != '\0' || parsed < 1UL || parsed > 16UL)
++					return "ERR APITRACE_DRAIN_RANGE_1_16";
++				count = static_cast<size_t>(parsed);
++			}
++			return RemoteApiTraceDrain(count);
++		}
++		return "ERR USAGE DEBUG APITRACE (START|STATUS|DRAIN|STOP|CLEAR)";
++	}
++
+ 	if (command == "MUTATE") {
+ 		static const std::string confirmation = "CONFIRM_MANIPULATED_ORACLE";
+ 		std::string target;
+@@ -6039,6 +6244,8 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			return "ERR NOT_FOUND";
+ 		}
+ 		if (action == "ADD") {
++			if (remote_api_trace_active)
++				return "ERR WATCH_INCOMPATIBLE_WITH_APITRACE";
+ 			std::string mode_text, address_text, length_text, option, extra;
+ 			input >> mode_text >> address_text >> length_text >> option >> extra;
+ 			for (auto &ch : mode_text) ch = static_cast<char>(toupper(ch));
+@@ -6259,6 +6466,10 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			remote_watch_saved_decoder = cpudecoder;
+ 			cpudecoder = &CPU_Core_Normal_Run;
+ 		}
++		if (remote_api_trace_active && cpudecoder != &CPU_Core_Normal_Run) {
++			remote_api_trace_saved_decoder = cpudecoder;
++			cpudecoder = &CPU_Core_Normal_Run;
++		}
+ 		DOSBOX_SetNormalLoop();
+ 		resume = true;
+ 		return "OK RUNNING";
+@@ -6273,6 +6484,10 @@ static Bitu RemoteDebuggerLoop(void)
+ 		cpudecoder = remote_watch_saved_decoder;
+ 		remote_watch_saved_decoder = NULL;
+ 	}
++	if (remote_api_trace_saved_decoder) {
++		cpudecoder = remote_api_trace_saved_decoder;
++		remote_api_trace_saved_decoder = NULL;
++	}
+ 	CBreakpoint::DeactivateBreakpoints();
+ 	{
+ 		std::lock_guard<std::mutex> lock(remote_debug_mutex);
+@@ -8095,6 +8310,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
+ 		remote_debug_enabled.store(true);
+ 		return true;
+ 	}
++	RemoteApiTraceObserve();
+ 	if (cpuLog) {
+ 		if (cpuLogCounter>0) {
+ 			LogInstruction(SegValue(cs),reg_eip,cpuLogFile);
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index 1e63ce6..1c866f2 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -142,7 +142,7 @@ static std::string handle_command(const std::string& cmd) {
+                DOSBOX_X_BUILD_ID
+                " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
+ #if C_DEBUG
+-               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,CHECKPOINT,HASH,WAIT,CONTINUE"
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,CHECKPOINT,HASH,WAIT,CONTINUE"
+ #else
+                " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
+ #endif

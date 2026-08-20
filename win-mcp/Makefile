@@ -19,11 +19,12 @@ SHARE    = ../share
 TOOLS    = ../tools
 EMU2     = $(TOOLS)/emu2
 
-# DOSBox-X (patched for ARM64 GL crash fix)
-DOSBOX   = $(TOOLS)/dosbox-x
+# Prefer the repository-built control fork; fall back to the checked-in binary.
+DOSBOX_FORK = $(TOOLS)/dosbox-x-src/src/dosbox-x
+DOSBOX   = $(if $(wildcard $(DOSBOX_FORK)),$(DOSBOX_FORK),$(TOOLS)/dosbox-x)
 DBCONF   = dosbox-test.conf
 
-.PHONY: all test testgui clean deploy
+.PHONY: all test testgui testcontrol clean deploy
 
 all: $(OUT)
 
@@ -81,14 +82,17 @@ testwin:
 	@mkdir -p $(SHARE)/_MAGIC_
 	@rm -f $(SHARE)/_MAGIC_/__WIN__.TX $(SHARE)/_MAGIC_/__WIN__.RX \
 	       $(SHARE)/_MAGIC_/__WIN__.ST $(SHARE)/_MAGIC_/__WIN__.BMP
-	./dosbox-run.sh $(DOSBOX) dosbox-win31.conf
-	@echo "Waiting for Windows 3.1 + WINMCP to boot..."
-	@sleep 18
+	DOSBOX_HEADLESS=1 ./dosbox-run.sh $(DOSBOX) dosbox-win31.conf dosbox-win31-fast.conf
+	@echo "Waiting on WINMCP readiness (no fixed boot delay)..."
 	node test-harness.js --timeout 120; \
 	  EXIT_CODE=$$?; \
 	  kill -9 $$(cat .dosbox.pid) 2>/dev/null; \
 	  rm -f .dosbox.pid; \
 	  exit $$EXIT_CODE
+
+# Host-side framing and identity tests. This is headless and starts no emulator.
+testcontrol:
+	node ../scripts/test-dosbox-control.js
 
 clean:
 	rm -f $(OUT) .emu2.pid .dosbox.pid

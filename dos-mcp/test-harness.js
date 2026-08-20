@@ -115,7 +115,12 @@ var tests = [
   {
     name: 'META VERSION',
     command: 'META VERSION',
-    expectPattern: /^OK MCP\/0\.10 /,
+    expectPattern: /^OK MCP\/0\.11 /,
+  },
+  {
+    name: 'META IDENTITY',
+    command: 'META IDENTITY',
+    expectPattern: /^OK TOOL=DOSMCP PROTOCOL=0\.11 BUILD=[0-9a-f]{64} FEATURES=.*META.*MEM.*TSR$/,
   },
   {
     name: 'CON CURSOR GET',

@@ -1,0 +1,675 @@
+From 56f28f868fe5a941ec4abc7195fc645624a34429 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 19:02:40 -0400
+Subject: [PATCH 10/19] feat(debugger): observe DOS file services
+
+---
+ include/debug.h                   |  30 ++++
+ include/tool_build_identity.h     |   2 +-
+ src/debug/debug.cpp               | 255 ++++++++++++++++++++++++++++++
+ src/dos/dos_files.cpp             | 148 +++++++++++++++--
+ src/gui/dosbox_control_server.cpp |   2 +-
+ 5 files changed, 419 insertions(+), 18 deletions(-)
+
+diff --git a/include/debug.h b/include/debug.h
+index d33f22e..1b1bac7 100644
+--- a/include/debug.h
++++ b/include/debug.h
+@@ -32,6 +32,36 @@ bool DEBUG_RemoteCommand(const char *command, char *response,
+                          unsigned int response_size,
+                          unsigned int timeout_ms);
+ 
++/* Read-only metadata hook for the remote DOS file-service observer. The DOS
++ * layer calls this after each service completes; non-debug builds compile the
++ * calls away below. Values of UINT16_MAX/UINT32_MAX mean no handle is known. */
++enum DEBUG_FileIoOperation {
++	DEBUG_FILEIO_OPEN,
++	DEBUG_FILEIO_CREATE,
++	DEBUG_FILEIO_READ,
++	DEBUG_FILEIO_WRITE,
++	DEBUG_FILEIO_SEEK,
++	DEBUG_FILEIO_RENAME
++};
++
++#if C_DEBUG
++void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
++                         uint16_t call_cs, uint32_t call_eip,
++                         uint16_t guest_handle, uint32_t system_handle,
++                         bool fcb, const char *path, const char *path2,
++                         bool success, uint16_t error, uint32_t requested,
++                         uint32_t actual, uint32_t seek_origin,
++                         uint32_t seek_argument, uint32_t seek_result);
++void DEBUG_FileIoHandleClosed(uint32_t system_handle);
++#else
++static inline void DEBUG_FileIoObserve(DEBUG_FileIoOperation, uint16_t,
++                                       uint16_t, uint32_t, uint16_t, uint32_t,
++                                       bool, const char *, const char *, bool,
++                                       uint16_t, uint32_t, uint32_t, uint32_t,
++                                       uint32_t, uint32_t) {}
++static inline void DEBUG_FileIoHandleClosed(uint32_t) {}
++#endif
++
+ extern Bitu cycle_count;
+ extern Bitu debugCallback;
+ 
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+index 6310863..7cc615b 100644
+--- a/include/tool_build_identity.h
++++ b/include/tool_build_identity.h
+@@ -1,2 +1,2 @@
+ /* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
+-#define DOSBOX_X_BUILD_ID "6b6d714e7146e95cd5301a222e798a2e918b3a1adb34f4d0fcac0c29c07899d3"
++#define DOSBOX_X_BUILD_ID "3695287d34edcb0ad27267c7630f719cfc32243744cb9b40609f675252e37c54"
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index 2ba3e71..cfb8076 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -33,6 +33,8 @@
+ #include <atomic>
+ #include <chrono>
+ #include <condition_variable>
++#include <deque>
++#include <map>
+ #include <mutex>
+ #include <set>
+ using namespace std;
+@@ -370,6 +372,127 @@ static bool remote_debug_response_ready = false;
+ static bool remote_oracle_manipulated = false;
+ static unsigned int remote_mutation_count = 0;
+ 
++struct RemoteFileIoEvent {
++	uint64_t sequence;
++	DEBUG_FileIoOperation operation;
++	uint16_t psp;
++	uint16_t call_cs;
++	uint32_t call_eip;
++	uint16_t guest_handle;
++	uint32_t system_handle;
++	bool fcb;
++	std::string path;
++	std::string path2;
++	bool success;
++	uint16_t error;
++	bool offset_before_known;
++	bool offset_after_known;
++	uint64_t offset_before;
++	uint64_t offset_after;
++	uint32_t requested;
++	uint32_t actual;
++	uint32_t seek_origin;
++	uint32_t seek_argument;
++};
++
++static bool remote_fileio_active = false;
++static size_t remote_fileio_capacity = 256;
++static uint64_t remote_fileio_next_sequence = 0;
++static uint64_t remote_fileio_dropped = 0;
++static std::deque<RemoteFileIoEvent> remote_fileio_events;
++static std::map<uint32_t, uint64_t> remote_fileio_offsets;
++
++static const char *RemoteFileIoOperationName(DEBUG_FileIoOperation operation)
++{
++	switch (operation) {
++	case DEBUG_FILEIO_OPEN: return "OPEN";
++	case DEBUG_FILEIO_CREATE: return "CREATE";
++	case DEBUG_FILEIO_READ: return "READ";
++	case DEBUG_FILEIO_WRITE: return "WRITE";
++	case DEBUG_FILEIO_SEEK: return "SEEK";
++	case DEBUG_FILEIO_RENAME: return "RENAME";
++	default: return "UNKNOWN";
++	}
++}
++
++static std::string RemoteFileIoBoundedPath(const char *path)
++{
++	if (!path) return std::string();
++	size_t length = 0;
++	while (length < 260U && path[length]) ++length;
++	return std::string(path, length);
++}
++
++void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
++	                     uint16_t call_cs, uint32_t call_eip,
++	                     uint16_t guest_handle, uint32_t system_handle,
++	                     bool fcb, const char *path, const char *path2,
++	                     bool success, uint16_t error, uint32_t requested,
++	                     uint32_t actual, uint32_t seek_origin,
++	                     uint32_t seek_argument, uint32_t seek_result)
++{
++	if (!remote_fileio_active) return;
++	RemoteFileIoEvent event;
++	event.sequence = remote_fileio_next_sequence++;
++	event.operation = operation;
++	event.psp = psp;
++	event.call_cs = call_cs;
++	event.call_eip = call_eip;
++	event.guest_handle = guest_handle;
++	event.system_handle = system_handle;
++	event.fcb = fcb;
++	event.path = RemoteFileIoBoundedPath(path);
++	event.path2 = RemoteFileIoBoundedPath(path2);
++	event.success = success;
++	event.error = success ? 0 : error;
++	event.offset_before_known = false;
++	event.offset_after_known = false;
++	event.offset_before = 0;
++	event.offset_after = 0;
++	event.requested = requested;
++	event.actual = actual;
++	event.seek_origin = seek_origin;
++	event.seek_argument = seek_argument;
++
++	if (system_handle != UINT32_MAX) {
++		const auto known = remote_fileio_offsets.find(system_handle);
++		if (known != remote_fileio_offsets.end()) {
++			event.offset_before_known = true;
++			event.offset_before = known->second;
++		}
++		if (success && (operation == DEBUG_FILEIO_OPEN ||
++		                operation == DEBUG_FILEIO_CREATE)) {
++			event.offset_before_known = true;
++			event.offset_after_known = true;
++			event.offset_before = 0;
++			event.offset_after = 0;
++			remote_fileio_offsets[system_handle] = 0;
++		} else if (success && operation == DEBUG_FILEIO_SEEK &&
++		           seek_result != UINT32_MAX) {
++			event.offset_after_known = true;
++			event.offset_after = seek_result;
++			remote_fileio_offsets[system_handle] = seek_result;
++		} else if (success &&
++		           (operation == DEBUG_FILEIO_READ || operation == DEBUG_FILEIO_WRITE) &&
++		           event.offset_before_known) {
++			event.offset_after_known = true;
++			event.offset_after = event.offset_before + actual;
++			remote_fileio_offsets[system_handle] = event.offset_after;
++		}
++	}
++
++	if (remote_fileio_events.size() >= remote_fileio_capacity) {
++		++remote_fileio_dropped;
++		return;
++	}
++	remote_fileio_events.push_back(event);
++}
++
++void DEBUG_FileIoHandleClosed(uint32_t system_handle)
++{
++	remote_fileio_offsets.erase(system_handle);
++}
++
+ enum RemoteWatchMode {
+ 	REMOTE_WATCH_READ,
+ 	REMOTE_WATCH_WRITE,
+@@ -5060,6 +5183,83 @@ static std::string RemoteDisassemble(uint16_t segment, uint32_t offset,
+ 	return out.str();
+ }
+ 
++static std::string RemoteFileIoHexBytes(const std::string &value)
++{
++	if (value.empty()) return "-";
++	std::ostringstream out;
++	out << std::hex << std::uppercase << std::setfill('0');
++	for (const unsigned char byte : value)
++		out << std::setw(2) << static_cast<unsigned int>(byte);
++	return out.str();
++}
++
++static void RemoteFileIoOptionalHex(std::ostringstream &out, bool known,
++	                                uint64_t value, unsigned int width)
++{
++	if (!known) {
++		out << "-";
++		return;
++	}
++	out << std::hex << std::uppercase << std::setfill('0')
++	    << std::setw(width) << value << std::dec;
++}
++
++static std::string RemoteFileIoStatus(void)
++{
++	std::ostringstream out;
++	out << "OK ACTIVE=" << (remote_fileio_active ? 1 : 0)
++	    << " CAPACITY=" << remote_fileio_capacity
++	    << " QUEUED=" << remote_fileio_events.size()
++	    << " DROPPED=" << remote_fileio_dropped
++	    << " NEXT=" << remote_fileio_next_sequence;
++	return out.str();
++}
++
++static std::string RemoteFileIoDrain(size_t count)
++{
++	const size_t drained = std::min(count, remote_fileio_events.size());
++	std::ostringstream out;
++	out << "OK COUNT=" << drained
++	    << " ACTIVE=" << (remote_fileio_active ? 1 : 0)
++	    << " DROPPED=" << remote_fileio_dropped;
++	for (size_t index = 0; index < drained; ++index) {
++		const RemoteFileIoEvent &event = remote_fileio_events.front();
++		out << "\nSEQ=" << event.sequence
++		    << " OP=" << RemoteFileIoOperationName(event.operation)
++		    << " SUCCESS=" << (event.success ? 1 : 0)
++		    << " ERROR=" << std::hex << std::uppercase << std::setfill('0')
++		    << std::setw(4) << event.error
++		    << " PSP=" << std::setw(4) << event.psp
++		    << " SITE=" << std::setw(4) << event.call_cs << ":"
++		    << std::setw(8) << event.call_eip << std::dec
++		    << " GH=";
++		RemoteFileIoOptionalHex(out, event.guest_handle != UINT16_MAX,
++		                        event.guest_handle, 4);
++		out << " SH=";
++		RemoteFileIoOptionalHex(out, event.system_handle != UINT32_MAX,
++		                        event.system_handle, 8);
++		out << " FCB=" << (event.fcb ? 1 : 0)
++		    << " PATH=" << RemoteFileIoHexBytes(event.path)
++		    << " PATH2=" << RemoteFileIoHexBytes(event.path2)
++		    << " BEFORE=";
++		RemoteFileIoOptionalHex(out, event.offset_before_known,
++		                        event.offset_before, 16);
++		out << " AFTER=";
++		RemoteFileIoOptionalHex(out, event.offset_after_known,
++		                        event.offset_after, 16);
++		out << " REQUEST=" << event.requested
++		    << " ACTUAL=" << event.actual
++		    << " ORIGIN=";
++		if (event.seek_origin == UINT32_MAX) out << "-";
++		else out << event.seek_origin;
++		out << " SEEK=";
++		RemoteFileIoOptionalHex(out, event.seek_argument != UINT32_MAX,
++		                        event.seek_argument, 8);
++		remote_fileio_events.pop_front();
++	}
++	return out.str();
++}
++
+ static bool RemoteReadSelectorWord(uint16_t selector, uint32_t offset,
+                                    uint16_t &value)
+ {
+@@ -5274,6 +5474,61 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 
+ 	if (command == "REGISTERS") return RemoteRegisterState();
+ 
++	if (command == "FILEIO") {
++		std::string action, value_text, extra;
++		input >> action >> value_text >> extra;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "STATUS") {
++			if (!value_text.empty()) return "ERR USAGE DEBUG FILEIO STATUS";
++			return RemoteFileIoStatus();
++		}
++		if (action == "START") {
++			if (!extra.empty()) return "ERR USAGE DEBUG FILEIO START [capacity]";
++			size_t capacity = 256;
++			if (!value_text.empty()) {
++				char *end = NULL;
++				const unsigned long parsed = strtoul(value_text.c_str(), &end, 10);
++				if (!end || *end != '\0' || parsed < 16 || parsed > 1024)
++					return "ERR FILEIO_CAPACITY_RANGE_16_1024";
++				capacity = static_cast<size_t>(parsed);
++			}
++			remote_fileio_active = false;
++			remote_fileio_events.clear();
++			remote_fileio_offsets.clear();
++			remote_fileio_capacity = capacity;
++			remote_fileio_next_sequence = 0;
++			remote_fileio_dropped = 0;
++			remote_fileio_active = true;
++			return RemoteFileIoStatus();
++		}
++		if (action == "STOP") {
++			if (!value_text.empty()) return "ERR USAGE DEBUG FILEIO STOP";
++			remote_fileio_active = false;
++			return RemoteFileIoStatus();
++		}
++		if (action == "CLEAR") {
++			if (!value_text.empty()) return "ERR USAGE DEBUG FILEIO CLEAR";
++			remote_fileio_events.clear();
++			remote_fileio_offsets.clear();
++			remote_fileio_next_sequence = 0;
++			remote_fileio_dropped = 0;
++			return RemoteFileIoStatus();
++		}
++		if (action == "DRAIN") {
++			if (!extra.empty()) return "ERR USAGE DEBUG FILEIO DRAIN [count]";
++			size_t count = 8;
++			if (!value_text.empty()) {
++				char *end = NULL;
++				const unsigned long parsed = strtoul(value_text.c_str(), &end, 10);
++				if (!end || *end != '\0' || parsed < 1 || parsed > 8)
++					return "ERR FILEIO_DRAIN_RANGE_1_8";
++				count = static_cast<size_t>(parsed);
++			}
++			return RemoteFileIoDrain(count);
++		}
++		return "ERR USAGE DEBUG FILEIO (START|STATUS|DRAIN|STOP|CLEAR)";
++	}
++
+ 	if (command == "MUTATE") {
+ 		static const std::string confirmation = "CONFIRM_MANIPULATED_ORACLE";
+ 		std::string target;
+diff --git a/src/dos/dos_files.cpp b/src/dos/dos_files.cpp
+index 73fb5a8..3053fbe 100644
+--- a/src/dos/dos_files.cpp
++++ b/src/dos/dos_files.cpp
+@@ -39,6 +39,7 @@
+ #include "cdrom.h"
+ #include "ide.h"
+ #include "bios_disk.h"
++#include "debug.h"
+ 
+ #define DOS_FILESTART 4
+ 
+@@ -55,6 +56,48 @@ extern bool enable_share_exe, enable_dbcs_tables;
+ extern int dos_clipboard_device_access;
+ extern const char *dos_clipboard_device_name;
+ 
++/* Capture service-entry context without changing the operation. The destructor
++ * records every exit path, including validation failures, after the DOS error
++ * and returned byte counts have reached their final values. */
++class DOSFileIoObservation {
++public:
++	DOSFileIoObservation(DEBUG_FileIoOperation operation_value,
++	                     const char *path_value = NULL,
++	                     const char *path2_value = NULL)
++	        : operation(operation_value), psp(dos.psp()), call_cs(SegValue(cs)),
++	          call_eip(reg_eip), guest_handle(UINT16_MAX),
++	          system_handle(UINT32_MAX), fcb(false),
++	          path(path_value ? path_value : ""),
++	          path2(path2_value ? path2_value : ""), success(false),
++	          requested(0), actual(0), seek_origin(UINT32_MAX),
++	          seek_argument(UINT32_MAX), seek_result(UINT32_MAX) {}
++
++	~DOSFileIoObservation()
++	{
++		DEBUG_FileIoObserve(operation, psp, call_cs, call_eip, guest_handle,
++		                    system_handle, fcb, path.empty() ? NULL : path.c_str(),
++		                    path2.empty() ? NULL : path2.c_str(), success,
++		                    success ? 0 : dos.errorcode, requested, actual,
++		                    seek_origin, seek_argument, seek_result);
++	}
++
++	DEBUG_FileIoOperation operation;
++	uint16_t psp;
++	uint16_t call_cs;
++	uint32_t call_eip;
++	uint16_t guest_handle;
++	uint32_t system_handle;
++	bool fcb;
++	std::string path;
++	std::string path2;
++	bool success;
++	uint32_t requested;
++	uint32_t actual;
++	uint32_t seek_origin;
++	uint32_t seek_argument;
++	uint32_t seek_result;
++};
++
+ #if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
+ 
+ #include <mach/mach_time.h>
+@@ -614,6 +657,7 @@ static bool PathExists(char const * const name) {
+ }
+ 
+ bool DOS_Rename(char const * const oldname,char const * const newname) {
++	DOSFileIoObservation observation(DEBUG_FILEIO_RENAME, oldname, newname);
+ 	uint8_t driveold;char fullold[DOS_PATHLENGTH];
+ 	uint8_t drivenew;char fullnew[DOS_PATHLENGTH];
+ 	if (!DOS_MakeName(oldname,fullold,&driveold)) return false;
+@@ -621,7 +665,10 @@ bool DOS_Rename(char const * const oldname,char const * const newname) {
+ 	while (strlen(fullnew)&&(*(fullnew+strlen(fullnew)-1)=='.'||*(fullnew+strlen(fullnew)-1)==' ')) *(fullnew+strlen(fullnew)-1)=0;
+ #if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+  #if !defined(OSFREE)
+-    if (Network_IsNetworkResource(oldname)) return Network_Rename(oldname,newname);
++    if (Network_IsNetworkResource(oldname)) {
++		observation.success = Network_Rename(oldname,newname);
++		return observation.success;
++	}
+  #endif
+ #endif
+ 
+@@ -673,11 +720,17 @@ bool DOS_Rename(char const * const oldname,char const * const newname) {
+ 			} while (toread == 0x8000);
+ 			if (!DOS_CloseFile(sourceHandle)||!DOS_CloseFile(targetHandle)) failed=true;
+ 		} else failed=true;
+-		if (!failed&&Drives[drivenew]->FileUnlink(fullold)) return true;
++		if (!failed&&Drives[drivenew]->FileUnlink(fullold)) {
++			observation.success = true;
++			return true;
++		}
+ 	} else
+ #endif
+ 
+-	if (Drives[drivenew]->Rename(fullold,fullnew)) return true;
++	if (Drives[drivenew]->Rename(fullold,fullnew)) {
++		observation.success = true;
++		return true;
++	}
+ 	/* Rename failed despite checks => no access */
+ 	DOS_SetError(DOSERR_ACCESS_DENIED);
+ 	return false;
+@@ -801,20 +854,29 @@ bool DOS_FindNext(void) {
+ 
+ bool DOS_ReadFile(uint16_t entry,uint8_t * data,uint16_t * amount,bool fcb) {
+ 	uint32_t handle = fcb?entry:RealHandle(entry);
++	DOSFileIoObservation observation(DEBUG_FILEIO_READ);
++	observation.guest_handle = entry;
++	observation.system_handle = handle;
++	observation.fcb = fcb;
++	observation.requested = *amount;
+ 	if (handle>=DOS_FILES) {
+ 		DOS_SetError(DOSERR_INVALID_HANDLE);
+ 		return false;
+ 	}
+ #if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+  #if !defined(OSFREE)
+-    if(Network_IsActiveResource(entry))
+-		return Network_ReadFile(entry,data,amount);
++    if(Network_IsActiveResource(entry)) {
++		observation.success = Network_ReadFile(entry,data,amount);
++		observation.actual = *amount;
++		return observation.success;
++	}
+  #endif
+ #endif
+ 	if (!Files[handle] || !Files[handle]->IsOpen()) {
+ 		DOS_SetError(DOSERR_INVALID_HANDLE);
+ 		return false;
+ 	}
++	observation.path = Files[handle]->GetName();
+ 
+     if (log_fileio) {
+         LOG(LOG_FILES, LOG_DEBUG)("Reading %d bytes from %s ", *amount, Files[handle]->name);
+@@ -828,25 +890,36 @@ bool DOS_ReadFile(uint16_t entry,uint8_t * data,uint16_t * amount,bool fcb) {
+ 	uint16_t toread=*amount;
+ 	bool ret=Files[handle]->Read(data,&toread);
+ 	*amount=toread;
++	observation.success=ret;
++	observation.actual=toread;
+ 	return ret;
+ }
+ 
+ bool DOS_WriteFile(uint16_t entry,const uint8_t * data,uint16_t * amount,bool fcb) {
+ 	uint32_t handle = fcb?entry:RealHandle(entry);
++	DOSFileIoObservation observation(DEBUG_FILEIO_WRITE);
++	observation.guest_handle = entry;
++	observation.system_handle = handle;
++	observation.fcb = fcb;
++	observation.requested = *amount;
+ 	if (handle>=DOS_FILES) {
+ 		DOS_SetError(DOSERR_INVALID_HANDLE);
+ 		return false;
+ 	}
+ #if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+  #if !defined(OSFREE)
+-    if(Network_IsActiveResource(entry))
+-		return Network_WriteFile(entry,data,amount);
++    if(Network_IsActiveResource(entry)) {
++		observation.success = Network_WriteFile(entry,data,amount);
++		observation.actual = *amount;
++		return observation.success;
++	}
+  #endif
+ #endif
+ 	if (!Files[handle] || !Files[handle]->IsOpen()) {
+ 		DOS_SetError(DOSERR_INVALID_HANDLE);
+ 		return false;
+ 	}
++	observation.path = Files[handle]->GetName();
+ 
+     if (log_fileio) {
+         LOG(LOG_FILES, LOG_DEBUG)("Writing %d bytes to %s", *amount, Files[handle]->name);
+@@ -860,31 +933,45 @@ bool DOS_WriteFile(uint16_t entry,const uint8_t * data,uint16_t * amount,bool fc
+ 	uint16_t towrite=*amount;
+ 	bool ret=Files[handle]->Write(data,&towrite);
+ 	*amount=towrite;
++	observation.success=ret;
++	observation.actual=towrite;
+ 	return ret;
+ }
+ 
+ bool DOS_SeekFile(uint16_t entry,uint32_t * pos,uint32_t type,bool fcb) {
+ 	uint32_t handle = fcb?entry:RealHandle(entry);
++	DOSFileIoObservation observation(DEBUG_FILEIO_SEEK);
++	observation.guest_handle = entry;
++	observation.system_handle = handle;
++	observation.fcb = fcb;
++	observation.seek_origin = type;
++	observation.seek_argument = *pos;
+ 	if (handle>=DOS_FILES) {
+ 		DOS_SetError(DOSERR_INVALID_HANDLE);
+ 		return false;
+ 	}
+ #if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+ # if !defined(OSFREE)
+-    if(Network_IsActiveResource(entry))
+-		return Network_SeekFile(entry,pos,type);
++    if(Network_IsActiveResource(entry)) {
++		observation.success = Network_SeekFile(entry,pos,type);
++		if (observation.success) observation.seek_result = *pos;
++		return observation.success;
++	}
+ # endif
+ #endif
+ 	if (!Files[handle] || !Files[handle]->IsOpen()) {
+ 		DOS_SetError(DOSERR_INVALID_HANDLE);
+ 		return false;
+ 	}
++	observation.path = Files[handle]->GetName();
+ 
+ 	if (log_fileio) {
+ 		LOG(LOG_FILES, LOG_DEBUG)("Seeking to %d bytes from position type (%d) in %s ", *pos, type, Files[handle]->name);
+ 	}
+ 
+-	return Files[handle]->Seek(pos,type);
++	observation.success = Files[handle]->Seek(pos,type);
++	if (observation.success) observation.seek_result = *pos;
++	return observation.success;
+ }
+ 
+ /* ert, 20100711: Locking extensions */
+@@ -929,6 +1016,7 @@ bool DOS_CloseFile(uint16_t entry, bool fcb, uint8_t * refcnt) {
+ 
+ 	Bits refs=Files[handle]->RemoveRef();
+ 	if (refs<=0) {
++		DEBUG_FileIoHandleClosed(handle);
+ 		delete Files[handle];
+ 		Files[handle]=nullptr;
+ 	}
+@@ -964,10 +1052,18 @@ bool openfile_deny_non_z=true;
+ #endif
+ 
+ bool DOS_CreateFile(char const * name,uint16_t attributes,uint16_t * entry,bool fcb) {
++	DOSFileIoObservation observation(DEBUG_FILEIO_CREATE, name);
++	observation.fcb = fcb;
+ 	// Creation of a device is the same as opening it
+ 	// Tc201 installer
+-	if (DOS_FindDevice(name) != DOS_DEVICES)
+-		return DOS_OpenFile(name, OPEN_READ, entry, fcb);
++	if (DOS_FindDevice(name) != DOS_DEVICES) {
++		observation.success = DOS_OpenFile(name, OPEN_READ, entry, fcb);
++		if (observation.success) {
++			observation.guest_handle = *entry;
++			observation.system_handle = fcb ? *entry : RealHandle(*entry);
++		}
++		return observation.success;
++	}
+ 
+ 	LOG(LOG_FILES,LOG_NORMAL)("file create attributes %X file %s",attributes,name);
+ 	char fullname[DOS_PATHLENGTH];uint8_t drive;
+@@ -986,8 +1082,14 @@ bool DOS_CreateFile(char const * name,uint16_t attributes,uint16_t * entry,bool
+ 	while (strlen(fullname)&&(*(fullname+strlen(fullname)-1)=='.'||*(fullname+strlen(fullname)-1)==' ')) *(fullname+strlen(fullname)-1)=0;
+ #if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+ # if !defined(OSFREE)
+-    if(Network_IsNetworkResource(name))
+-		return Network_CreateFile(name,attributes,entry);
++    if(Network_IsNetworkResource(name)) {
++		observation.success = Network_CreateFile(name,attributes,entry);
++		if (observation.success) {
++			observation.guest_handle = *entry;
++			observation.system_handle = fcb ? *entry : RealHandle(*entry);
++		}
++		return observation.success;
++	}
+ # endif
+ #endif
+ 
+@@ -1023,6 +1125,9 @@ bool DOS_CreateFile(char const * name,uint16_t attributes,uint16_t * entry,bool
+ 		}
+ 		if (!fcb) psp.SetFileHandle(*entry,handle);
+ 		if (Files[handle]) Drives[drive]->EmptyCache();
++		observation.success = true;
++		observation.guest_handle = *entry;
++		observation.system_handle = handle;
+ 		return true;
+ 	} else {
+ 		if(dos.errorcode==DOSERR_ACCESS_DENIED||dos.errorcode==DOSERR_WRITE_PROTECTED) return false;
+@@ -1033,6 +1138,8 @@ bool DOS_CreateFile(char const * name,uint16_t attributes,uint16_t * entry,bool
+ }
+ 
+ bool DOS_OpenFile(char const * name,uint8_t flags,uint16_t * entry,bool fcb) {
++	DOSFileIoObservation observation(DEBUG_FILEIO_OPEN, name);
++	observation.fcb = fcb;
+ 	/* First check for devices */
+ 	if (flags>2) LOG(LOG_FILES,LOG_NORMAL)("Special file open command %X file %s",flags,name); // FIXME: Why? Is there something about special opens DOSBox doesn't handle properly?
+ 	else LOG(LOG_FILES,LOG_NORMAL)("file open command %X file %s",flags,name);
+@@ -1055,8 +1162,14 @@ bool DOS_OpenFile(char const * name,uint8_t flags,uint16_t * entry,bool fcb) {
+ 
+ #if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+ # if !defined(OSFREE)
+-    if(Network_IsNetworkResource(name))
+-		return Network_OpenFile(name,flags,entry);
++    if(Network_IsNetworkResource(name)) {
++		observation.success = Network_OpenFile(name,flags,entry);
++		if (observation.success) {
++			observation.guest_handle = *entry;
++			observation.system_handle = RealHandle(*entry);
++		}
++		return observation.success;
++	}
+ # endif
+ #endif
+ 	uint8_t handle=255;		
+@@ -1105,6 +1218,9 @@ bool DOS_OpenFile(char const * name,uint8_t flags,uint16_t * entry,bool fcb) {
+ 		Files[handle]->AddRef();
+ 		psp.SetFileHandle(*entry,handle);
+ 		Files[handle]->drive = drive;
++		observation.success = true;
++		observation.guest_handle = *entry;
++		observation.system_handle = handle;
+ 		return true;
+ 	} else {
+ 		//Test if file exists, but opened in read-write mode (and writeprotected)
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index 062a753..808e886 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -142,7 +142,7 @@ static std::string handle_command(const std::string& cmd) {
+                DOSBOX_X_BUILD_ID
+                " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
+ #if C_DEBUG
+-               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,WAIT,CONTINUE"
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,WAIT,CONTINUE"
+ #else
+                " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
+ #endif

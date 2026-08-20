@@ -1,0 +1,857 @@
+From 7a6cec0fa05ab18d574ca23095af5bf4b3066827 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 22:51:19 -0400
+Subject: [PATCH 17/19] feat(debugger): verify deterministic replay
+ dependencies
+
+---
+ include/debug.h                   |  12 +-
+ include/pic.h                     |   1 +
+ include/tool_build_identity.h     |   2 +-
+ src/cpu/core_normal.cpp           |  12 +-
+ src/cpu/cpu.cpp                   |   2 +
+ src/debug/debug.cpp               | 384 ++++++++++++++++++++++++++++--
+ src/dos/dos.cpp                   |   6 +
+ src/dos/dos_files.cpp             |  16 +-
+ src/gui/dosbox_control_server.cpp |   2 +-
+ src/hardware/cmos.cpp             |  15 ++
+ src/hardware/pic.cpp              |  43 +++-
+ 11 files changed, 470 insertions(+), 25 deletions(-)
+
+diff --git a/include/debug.h b/include/debug.h
+index 0fb7a18..e2007c5 100644
+--- a/include/debug.h
++++ b/include/debug.h
+@@ -52,16 +52,22 @@ void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
+                          bool fcb, const char *path, const char *path2,
+                          bool success, uint16_t error, uint32_t requested,
+                          uint32_t actual, uint32_t seek_origin,
+-                         uint32_t seek_argument, uint32_t seek_result);
++                         uint32_t seek_argument, uint32_t seek_result,
++                         const uint8_t *read_data, uint32_t read_data_count);
+ void DEBUG_FileIoHandleClosed(uint32_t system_handle);
++int DEBUG_DeterminismInterruptDecision(uint8_t vector, bool nmi);
++extern bool DEBUG_determinism_active;
+ #else
+ static inline void DEBUG_FileIoObserve(DEBUG_FileIoOperation, uint16_t,
+                                        uint16_t, uint32_t, uint16_t, uint32_t,
+                                        uint16_t, uint32_t,
+                                        bool, const char *, const char *, bool,
+                                        uint16_t, uint32_t, uint32_t, uint32_t,
+-                                       uint32_t, uint32_t) {}
++                                       uint32_t, uint32_t, const uint8_t *,
++                                       uint32_t) {}
+ static inline void DEBUG_FileIoHandleClosed(uint32_t) {}
++static inline int DEBUG_DeterminismInterruptDecision(uint8_t, bool) { return 1; }
++static const bool DEBUG_determinism_active = false;
+ #endif
+ 
+ extern Bitu cycle_count;
+@@ -73,5 +79,5 @@ bool DEBUG_ExceptionBreakpoint(Bitu which, Bitu error);
+ void DEBUG_HeavyWriteLogInstruction(void);
+ /* Counts instructions executed by the normal core while deterministic replay
+  * tracking is active. Replay mode deliberately forces the normal core. */
+-void DEBUG_RemoteInstructionRetired(void);
++bool DEBUG_RemoteInstructionRetired(void);
+ #endif
+diff --git a/include/pic.h b/include/pic.h
+index 10593ec..221586b 100644
+--- a/include/pic.h
++++ b/include/pic.h
+@@ -78,6 +78,7 @@ void PIC_DeActivateIRQ(Bitu irq);
+ void PIC_EdgeTrigger(Bitu irq,bool set=true);
+ 
+ void PIC_runIRQs(void);
++bool PIC_ReplayInterrupt(uint8_t vector, bool nmi);
+ bool PIC_RunQueue(void);
+ 
+ //Delay in milliseconds
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+index 32cb4cc..01ec83a 100644
+--- a/include/tool_build_identity.h
++++ b/include/tool_build_identity.h
+@@ -1,2 +1,2 @@
+ /* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
+-#define DOSBOX_X_BUILD_ID "e1ef159ae380939117c7ad8fa6e2f091b4d31f429629da6c47210e9d4c1594d7"
++#define DOSBOX_X_BUILD_ID "6a9e5c44c4d366ecd483d33cd82576aca7e8b77c10fac79cbf33bd5423c7c615"
+diff --git a/src/cpu/core_normal.cpp b/src/cpu/core_normal.cpp
+index 007bda6..5d779bb 100644
+--- a/src/cpu/core_normal.cpp
++++ b/src/cpu/core_normal.cpp
+@@ -181,7 +181,17 @@ Bits CPU_Core_Normal_Run(void) {
+ #endif
+ 		cycle_count++;
+ #if C_DEBUG && C_HEAVY_DEBUG
+-		DEBUG_RemoteInstructionRetired();
++		if (DEBUG_RemoteInstructionRetired()) {
++			/* A replayed interrupt changes CS:EIP and possibly the data/stack
++			 * descriptors at this exact between-instructions boundary. Refresh
++			 * the decoder cache before fetching the handler's first opcode. */
++			LOADIP;
++			core.opcode_index=cpu.code.big*(Bitu)0x200u;
++			core.prefixes=cpu.code.big;
++			core.ea_table=&EATable[cpu.code.big*256u];
++			BaseDS=SegBase(ds);
++			BaseSS=SegBase(ss);
++		}
+ #endif
+ restart_opcode:
+ 		switch (core.opcode_index+Fetchb()) {
+diff --git a/src/cpu/cpu.cpp b/src/cpu/cpu.cpp
+index 9768fcb..f6cef39 100644
+--- a/src/cpu/cpu.cpp
++++ b/src/cpu/cpu.cpp
+@@ -594,6 +594,8 @@ void menu_update_autocycle(void) {
+ void CPU_NMI_Interrupt() {
+     /* WARNING: Do not call while running inside a CPU core loop */
+ 	if (CPU_NMI_active) E_Exit("CPU_NMI_Interrupt() called while NMI already active");
++	if (DEBUG_determinism_active &&
++	    DEBUG_DeterminismInterruptDecision(2, true) <= 0) return;
+ 	CPU_NMI_active = true;
+ 	CPU_NMI_pending = false;
+     CPU_Interrupt(2/*INT 2 = NMI*/,0,reg_eip);
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index c8933bc..3bedf94 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -40,6 +40,7 @@
+ using namespace std;
+ 
+ #include "debug.h"
++#include "dos_inc.h"
+ #include "cross.h" //snprintf
+ #include "fpu.h"
+ #include "bios.h"
+@@ -399,6 +400,43 @@ struct RemoteReplayInput {
+ static std::vector<RemoteReplayInput> remote_replay_input_log;
+ static std::deque<RemoteReplayInput> remote_replay_pending_inputs;
+ static size_t remote_replay_skipped_inputs = 0;
++
++enum RemoteDeterminismMode {
++	REMOTE_DETERMINISM_OFF,
++	REMOTE_DETERMINISM_RECORD,
++	REMOTE_DETERMINISM_VERIFY
++};
++enum RemoteDeterminismEventKind {
++	REMOTE_DETERMINISM_READ,
++	REMOTE_DETERMINISM_IRQ,
++	REMOTE_DETERMINISM_NMI
++};
++struct RemoteDeterminismEvent {
++	RemoteDeterminismEventKind kind;
++	uint64_t sequence;
++	std::string path;
++	bool offset_known;
++	uint64_t offset;
++	bool success;
++	uint16_t error;
++	uint32_t requested;
++	std::vector<uint8_t> bytes;
++	uint8_t vector;
++	uint16_t cs;
++	uint32_t eip;
++	uint64_t cpu_hash;
++};
++static RemoteDeterminismMode remote_determinism_mode = REMOTE_DETERMINISM_OFF;
++bool DEBUG_determinism_active = false;
++static std::vector<RemoteDeterminismEvent> remote_determinism_events;
++static bool remote_determinism_log_valid = false;
++static size_t remote_determinism_cursor = 0;
++static size_t remote_determinism_bytes = 0;
++static bool remote_determinism_failed = false;
++static std::string remote_determinism_failure;
++static const size_t remote_determinism_event_capacity = 4096U;
++static const size_t remote_determinism_byte_capacity = 1024U * 1024U;
++extern bool sync_time;
+ enum RemoteCheckpointAction {
+ 	REMOTE_CHECKPOINT_NONE,
+ 	REMOTE_CHECKPOINT_SAVE,
+@@ -425,6 +463,15 @@ public:
+ 		writePOD(stream, remote_replay_sequence);
+ 		writePOD(stream, mouse_x);
+ 		writePOD(stream, mouse_y);
++		const uint32_t file_count = static_cast<uint32_t>(DOS_FILES);
++		writePOD(stream, file_count);
++		for (uint32_t index = 0; index < file_count; ++index) {
++			uint32_t position = 0;
++			const bool known = Files[index] && Files[index]->IsOpen() &&
++			                   Files[index]->Seek(&position, DOS_SEEK_CUR);
++			writePOD(stream, known);
++			writePOD(stream, position);
++		}
+ 		remote_replay_save_component_written = stream.good();
+ 	}
+ 
+@@ -434,12 +481,34 @@ public:
+ 		bool active = false;
+ 		uint64_t sequence = 0;
+ 		uint16_t mouse_x = 0, mouse_y = 0;
++		uint32_t file_count = 0;
+ 		readPOD(stream, magic);
+ 		readPOD(stream, active);
+ 		readPOD(stream, sequence);
+ 		readPOD(stream, mouse_x);
+ 		readPOD(stream, mouse_y);
+-		if (!stream.good() || magic != UINT32_C(0x52525031)) return;
++		readPOD(stream, file_count);
++		if (!stream.good() || magic != UINT32_C(0x52525031) ||
++		    file_count != static_cast<uint32_t>(DOS_FILES) || file_count > 4096U)
++			return;
++		std::vector<std::pair<bool, uint32_t> > positions;
++		positions.reserve(file_count);
++		for (uint32_t index = 0; index < file_count; ++index) {
++			bool known = false;
++			uint32_t position = 0;
++			readPOD(stream, known);
++			readPOD(stream, position);
++			positions.push_back(std::make_pair(known, position));
++		}
++		if (!stream.good()) return;
++		for (uint32_t index = 0; index < file_count; ++index) {
++			if (!positions[index].first) continue;
++			uint32_t position = positions[index].second;
++			if (!Files[index] || !Files[index]->IsOpen() ||
++			    !Files[index]->Seek(&position, DOS_SEEK_SET) ||
++			    position != positions[index].second)
++				return;
++		}
+ 		remote_replay_active = active;
+ 		remote_replay_sequence = sequence;
+ 		void GFX_SetReplayMousePosition(uint16_t x, uint16_t y);
+@@ -454,6 +523,26 @@ static RemoteReplaySaveState &RemoteReplayStateComponent()
+ 	return component;
+ }
+ 
++static void RemoteDeterminismFail(const char *reason);
++
++static uint64_t RemoteDeterminismCpuHash()
++{
++	FillFlags();
++	uint64_t hash = UINT64_C(14695981039346656037);
++	const uint64_t values[] = {
++		reg_eax, reg_ebx, reg_ecx, reg_edx, reg_esi, reg_edi, reg_ebp, reg_esp,
++		reg_eip, reg_flags, SegValue(cs), SegValue(ss), SegValue(ds), SegValue(es),
++		SegValue(fs), SegValue(gs), Keyb_ig_status()
++	};
++	const unsigned int widths[] = {4,4,4,4,4,4,4,4,4,4,2,2,2,2,2,2,4};
++	for (size_t index = 0; index < sizeof(values) / sizeof(values[0]); ++index)
++		for (unsigned int byte = 0; byte < widths[index]; ++byte) {
++			hash ^= static_cast<uint8_t>(values[index] >> (byte * 8U));
++			hash *= UINT64_C(1099511628211);
++		}
++	return hash;
++}
++
+ static void RemoteReplayDeliverInputs()
+ {
+ 	/* Never inject late. A missed boundary is a replay-integrity failure, so
+@@ -479,11 +568,39 @@ static void RemoteReplayDeliverInputs()
+ 	}
+ }
+ 
+-void DEBUG_RemoteInstructionRetired(void)
++bool DEBUG_RemoteInstructionRetired(void)
+ {
+-	if (!remote_replay_active) return;
++	if (!remote_replay_active) return false;
+ 	++remote_replay_sequence;
+ 	RemoteReplayDeliverInputs();
++	bool injected_interrupt = false;
++	while (remote_determinism_mode == REMOTE_DETERMINISM_VERIFY &&
++	       remote_determinism_cursor < remote_determinism_events.size()) {
++		const RemoteDeterminismEvent &expected =
++		        remote_determinism_events[remote_determinism_cursor];
++		if (expected.kind != REMOTE_DETERMINISM_IRQ &&
++		    expected.kind != REMOTE_DETERMINISM_NMI) break;
++		if (expected.sequence == UINT64_MAX) {
++			RemoteDeterminismFail("INTERRUPT_SEQUENCE_OVERFLOW");
++			break;
++		}
++		if (expected.sequence + 1U != remote_replay_sequence) break;
++		if (!PIC_ReplayInterrupt(expected.vector,
++		                         expected.kind == REMOTE_DETERMINISM_NMI)) {
++			RemoteDeterminismFail("INTERRUPT_VECTOR_UNROUTABLE");
++			break;
++		}
++		++remote_determinism_cursor;
++		injected_interrupt = true;
++	}
++	if (remote_determinism_mode == REMOTE_DETERMINISM_VERIFY &&
++	    remote_determinism_cursor < remote_determinism_events.size() &&
++	    remote_determinism_events[remote_determinism_cursor].sequence +
++	            ((remote_determinism_events[remote_determinism_cursor].kind ==
++	                      REMOTE_DETERMINISM_READ) ? 0U : 1U) <
++	            remote_replay_sequence)
++		RemoteDeterminismFail("EXPECTED_EVENT_MISSING");
++	return injected_interrupt;
+ }
+ 
+ struct RemoteFileIoEvent {
+@@ -520,6 +637,7 @@ static uint64_t remote_fileio_next_sequence = 0;
+ static uint64_t remote_fileio_dropped = 0;
+ static std::deque<RemoteFileIoEvent> remote_fileio_events;
+ static std::map<uint32_t, uint64_t> remote_fileio_offsets;
++static uint64_t remote_observer_instruction_sequence = 0;
+ 
+ /* Selector translation is defined with the debugger helpers below. */
+ uint64_t GetAddress(uint16_t seg, uint32_t offset);
+@@ -554,12 +672,6 @@ static std::vector<RemoteApiTraceProbe> remote_api_trace_probes;
+ static std::deque<RemoteApiTraceEvent> remote_api_trace_events;
+ static CPU_Decoder *remote_api_trace_saved_decoder = NULL;
+ 
+-/* FILEIO callbacks execute below the CPU dispatch boundary while APITRACE
+- * probes execute at instruction entry. A shared monotonically increasing
+- * instruction sequence lets the host establish their exact order without
+- * pretending that the real-mode DOS service stack is a Win16 task stack. */
+-static uint64_t remote_observer_instruction_sequence = 0;
+-
+ /* Code coverage is deliberately an address collector, not a disassembler.
+  * A reviewed host plan gives exact Win16 basic-block boundaries meaning; the
+  * emulator only records which instruction addresses actually executed inside
+@@ -672,6 +784,76 @@ static void RemoteFileIoCaptureCallers(RemoteFileIoEvent &event)
+ 	}
+ }
+ 
++static void RemoteDeterminismFail(const char *reason)
++{
++	if (remote_determinism_failed) return;
++	remote_determinism_failed = true;
++	remote_determinism_failure = reason;
++	/* Keep VERIFY armed until the heavy-debug boundary stops execution. This
++	 * suppresses live IRQ/NMI delivery during the one loop transition needed
++	 * to enter the debugger after a fail-closed mismatch. */
++	if (remote_determinism_mode != REMOTE_DETERMINISM_VERIFY) {
++		remote_determinism_mode = REMOTE_DETERMINISM_OFF;
++		DEBUG_determinism_active = false;
++	}
++}
++
++static bool RemoteDeterminismMatches(const RemoteDeterminismEvent &expected,
++	                                  const RemoteDeterminismEvent &actual)
++{
++	return expected.kind == actual.kind && expected.sequence == actual.sequence &&
++	       expected.path == actual.path &&
++	       expected.offset_known == actual.offset_known &&
++	       (!expected.offset_known || expected.offset == actual.offset) &&
++	       expected.success == actual.success && expected.error == actual.error &&
++	       expected.requested == actual.requested &&
++	       expected.bytes == actual.bytes && expected.vector == actual.vector;
++}
++
++static void RemoteDeterminismObserve(const RemoteDeterminismEvent &event)
++{
++	if (remote_determinism_mode == REMOTE_DETERMINISM_OFF) return;
++	if (remote_determinism_mode == REMOTE_DETERMINISM_RECORD) {
++		if (remote_determinism_events.size() >= remote_determinism_event_capacity ||
++		    event.bytes.size() > remote_determinism_byte_capacity - remote_determinism_bytes) {
++			RemoteDeterminismFail("CAPACITY");
++			return;
++		}
++		remote_determinism_bytes += event.bytes.size();
++		remote_determinism_events.push_back(event);
++		return;
++	}
++	if (remote_determinism_cursor >= remote_determinism_events.size()) {
++		RemoteDeterminismFail("UNEXPECTED_EVENT");
++		return;
++	}
++	if (!RemoteDeterminismMatches(remote_determinism_events[remote_determinism_cursor],
++	                              event)) {
++		RemoteDeterminismFail("EVENT_MISMATCH");
++		return;
++	}
++	++remote_determinism_cursor;
++}
++
++int DEBUG_DeterminismInterruptDecision(uint8_t vector, bool nmi)
++{
++	if (remote_determinism_mode == REMOTE_DETERMINISM_OFF) return 1;
++	RemoteDeterminismEvent event = {};
++	event.kind = nmi ? REMOTE_DETERMINISM_NMI : REMOTE_DETERMINISM_IRQ;
++	event.sequence = remote_replay_sequence;
++	event.vector = vector;
++	event.cs = SegValue(cs);
++	event.eip = reg_eip;
++	event.cpu_hash = RemoteDeterminismCpuHash();
++	if (remote_determinism_mode == REMOTE_DETERMINISM_RECORD) {
++		RemoteDeterminismObserve(event);
++		return remote_determinism_failed ? -1 : 1;
++	}
++	/* VERIFY holds the real pending request. The retired-boundary hook validates
++	 * and acknowledges it only at the retained delivery sequence. */
++	return 0;
++}
++
+ void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
+ 	                     uint16_t call_cs, uint32_t call_eip,
+ 	                     uint16_t call_ss, uint32_t call_ebp,
+@@ -679,9 +861,11 @@ void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
+ 	                     bool fcb, const char *path, const char *path2,
+ 	                     bool success, uint16_t error, uint32_t requested,
+ 	                     uint32_t actual, uint32_t seek_origin,
+-	                     uint32_t seek_argument, uint32_t seek_result)
++	                     uint32_t seek_argument, uint32_t seek_result,
++	                     const uint8_t *read_data, uint32_t read_data_count)
+ {
+-	if (!remote_fileio_active) return;
++	if (!remote_fileio_active && remote_determinism_mode == REMOTE_DETERMINISM_OFF)
++		return;
+ 	RemoteFileIoEvent event;
+ 	event.sequence = remote_fileio_next_sequence++;
+ 	event.instruction_sequence = remote_observer_instruction_sequence;
+@@ -691,7 +875,7 @@ void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
+ 	event.call_eip = call_eip;
+ 	event.call_ss = call_ss;
+ 	event.call_ebp = call_ebp;
+-	RemoteFileIoCaptureCallers(event);
++	if (remote_fileio_active) RemoteFileIoCaptureCallers(event);
+ 	event.guest_handle = guest_handle;
+ 	event.system_handle = system_handle;
+ 	event.fcb = fcb;
+@@ -735,6 +919,27 @@ void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
+ 		}
+ 	}
+ 
++	if (operation == DEBUG_FILEIO_READ) {
++		RemoteDeterminismEvent replay_event = {};
++		replay_event.kind = REMOTE_DETERMINISM_READ;
++		replay_event.sequence = remote_replay_sequence;
++		replay_event.path = event.path;
++		replay_event.offset_known = event.offset_before_known;
++		replay_event.offset = event.offset_before;
++		replay_event.success = success;
++		replay_event.error = success ? 0 : error;
++		replay_event.requested = requested;
++		replay_event.vector = 0;
++		if (success && read_data_count == actual && read_data_count != 0 && read_data)
++			replay_event.bytes.assign(read_data, read_data + read_data_count);
++		else if (success && read_data_count != actual) {
++			RemoteDeterminismFail("READ_PAYLOAD_UNAVAILABLE");
++			return;
++		}
++		RemoteDeterminismObserve(replay_event);
++	}
++
++	if (!remote_fileio_active) return;
+ 	if (remote_fileio_events.size() >= remote_fileio_capacity) {
+ 		++remote_fileio_dropped;
+ 		return;
+@@ -5906,6 +6111,7 @@ static bool RemoteCheckpointArchiveMatches(const std::string &path,
+ 		bool active = false;
+ 		uint64_t sequence = 0;
+ 		uint16_t mouse_x = 0, mouse_y = 0;
++		uint32_t file_count = 0;
+ 		const int magic_bytes = unzReadCurrentFile(archive, &magic, sizeof(magic));
+ 		const int active_bytes = unzReadCurrentFile(archive, &active, sizeof(active));
+ 		const int sequence_bytes =
+@@ -5914,6 +6120,20 @@ static bool RemoteCheckpointArchiveMatches(const std::string &path,
+ 		        unzReadCurrentFile(archive, &mouse_x, sizeof(mouse_x));
+ 		const int mouse_y_bytes =
+ 		        unzReadCurrentFile(archive, &mouse_y, sizeof(mouse_y));
++		const int file_count_bytes =
++		        unzReadCurrentFile(archive, &file_count, sizeof(file_count));
++		bool file_positions_valid = file_count_bytes == static_cast<int>(sizeof(file_count)) &&
++		                            file_count == static_cast<uint32_t>(DOS_FILES) &&
++		                            file_count <= 4096U;
++		for (uint32_t index = 0; file_positions_valid && index < file_count; ++index) {
++			bool known = false;
++			uint32_t position = 0;
++			file_positions_valid =
++			        unzReadCurrentFile(archive, &known, sizeof(known)) ==
++			                static_cast<int>(sizeof(known)) &&
++			        unzReadCurrentFile(archive, &position, sizeof(position)) ==
++			                static_cast<int>(sizeof(position));
++		}
+ 		uint8_t extra = 0;
+ 		const int extra_bytes = unzReadCurrentFile(archive, &extra, sizeof(extra));
+ 		const int member_close = unzCloseCurrentFile(archive);
+@@ -5922,6 +6142,7 @@ static bool RemoteCheckpointArchiveMatches(const std::string &path,
+ 		          sequence_bytes == static_cast<int>(sizeof(sequence)) &&
+ 		          mouse_x_bytes == static_cast<int>(sizeof(mouse_x)) &&
+ 		          mouse_y_bytes == static_cast<int>(sizeof(mouse_y)) &&
++		          file_positions_valid &&
+ 		          extra_bytes == 0 && member_close == UNZ_OK &&
+ 		          magic == UINT32_C(0x52525031) && active &&
+ 		          sequence == expected_sequence;
+@@ -5973,6 +6194,11 @@ static std::string RemotePerformCheckpointAction()
+ 	} else if (!RemoteCheckpointFileExists(path)) {
+ 		result = "ERR CHECKPOINT_NOT_FOUND";
+ 	} else {
++		/* The retained event log is host-side replay evidence. Never let a
++		 * restore itself append to or consume that log; VERIFY explicitly arms
++		 * comparison after the checkpoint has loaded. */
++		remote_determinism_mode = REMOTE_DETERMINISM_OFF;
++		DEBUG_determinism_active = false;
+ 		remote_replay_load_component_seen = false;
+ 		SaveState::instance().load(0);
+ 		if (!remote_replay_load_component_seen) {
+@@ -6166,6 +6392,67 @@ static std::string RemoteReplayInputs()
+ 	return out.str();
+ }
+ 
++static std::string RemoteDeterminismStatus()
++{
++	const char *mode = remote_determinism_mode == REMOTE_DETERMINISM_RECORD ?
++	                         "RECORD" :
++	                   remote_determinism_mode == REMOTE_DETERMINISM_VERIFY ?
++	                         "VERIFY" : "OFF";
++	std::ostringstream out;
++	out << "OK MODE=" << mode << " SEQUENCE=" << remote_replay_sequence
++	    << " LOG_VALID=" << (remote_determinism_log_valid ? 1 : 0)
++	    << " EVENTS=" << remote_determinism_events.size()
++	    << " CURSOR=" << remote_determinism_cursor
++	    << " BYTES=" << remote_determinism_bytes
++	    << " FAILED=" << (remote_determinism_failed ? 1 : 0)
++	    << " CLOCK=EMULATED_RESTORED SYNC_TIME=" << (sync_time ? 1 : 0)
++	    << " FAILURE="
++	    << (remote_determinism_failure.empty() ? "-" : remote_determinism_failure);
++	if (remote_determinism_cursor < remote_determinism_events.size()) {
++		const RemoteDeterminismEvent &next =
++		        remote_determinism_events[remote_determinism_cursor];
++		const char *kind = next.kind == REMOTE_DETERMINISM_READ ? "READ" :
++		                   next.kind == REMOTE_DETERMINISM_IRQ ? "IRQ" : "NMI";
++		out << " NEXT_KIND=" << kind << " NEXT_SEQUENCE=" << next.sequence;
++		if (next.kind != REMOTE_DETERMINISM_READ)
++			out << " NEXT_VECTOR=" << static_cast<unsigned int>(next.vector);
++	}
++	return out.str();
++}
++
++static std::string RemoteDeterminismLog(size_t count)
++{
++	if (!remote_determinism_log_valid) return "ERR DETERMINISM_LOG_EMPTY";
++	const size_t end = std::min(count, remote_determinism_events.size());
++	std::ostringstream out;
++	out << "OK EVENTS=" << remote_determinism_events.size()
++	    << " RETURNED=" << end;
++	for (size_t index = 0; index < end; ++index) {
++		const RemoteDeterminismEvent &event = remote_determinism_events[index];
++		const char *kind = event.kind == REMOTE_DETERMINISM_READ ? "READ" :
++		                   event.kind == REMOTE_DETERMINISM_IRQ ? "IRQ" : "NMI";
++		out << "\nINDEX=" << index << " KIND=" << kind
++		    << " SEQUENCE=" << event.sequence;
++		if (event.kind == REMOTE_DETERMINISM_READ) {
++			uint32_t hash = UINT32_C(2166136261);
++			for (const auto byte : event.bytes)
++				hash = (hash ^ byte) * UINT32_C(16777619);
++			out << " PATH=" << RemoteFileIoHexBytes(event.path)
++			    << " REQUESTED=" << event.requested
++			    << " ACTUAL=" << event.bytes.size()
++			    << " FNV1A32=" << RemoteHexValue(hash, 8);
++		} else {
++			out << " VECTOR=" << static_cast<unsigned int>(event.vector)
++			    << " CS=" << RemoteHexValue(event.cs, 4)
++			    << " EIP=" << RemoteHexValue(event.eip, 8)
++			    << " CPUHASH=" << RemoteHexValue(
++			            static_cast<uint32_t>(event.cpu_hash >> 32U), 8)
++			    << RemoteHexValue(static_cast<uint32_t>(event.cpu_hash), 8);
++		}
++	}
++	return out.str();
++}
++
+ static std::string RemoteExecuteCommand(const std::string &request,
+                                         bool &resume);
+ 
+@@ -6394,6 +6681,71 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		return "ERR USAGE DEBUG INPUT <STATUS|ADD|LOG|REPLAY|CLEAR>";
+ 	}
+ 
++	if (command == "DETERMINISM") {
++		std::string action, value, extra;
++		input >> action >> value >> extra;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "LOG") {
++			if (!extra.empty()) return "ERR USAGE DEBUG DETERMINISM LOG [count]";
++			uint64_t count = 64;
++			if (!value.empty() && (!RemoteParseDecimalSequence(value, count) ||
++			                       count < 1U || count > 256U))
++				return "ERR DETERMINISM_LOG_COUNT_RANGE_1_256";
++			return RemoteDeterminismLog(static_cast<size_t>(count));
++		}
++		if (!value.empty() || !extra.empty())
++			return "ERR USAGE DEBUG DETERMINISM <STATUS|RECORD|VERIFY|STOP|CLEAR|LOG>";
++		if (action == "STATUS") return RemoteDeterminismStatus();
++		if (action == "CLEAR") {
++			remote_determinism_mode = REMOTE_DETERMINISM_OFF;
++			DEBUG_determinism_active = false;
++			remote_determinism_events.clear();
++			remote_determinism_log_valid = false;
++			remote_determinism_cursor = 0;
++			remote_determinism_bytes = 0;
++			remote_determinism_failed = false;
++			remote_determinism_failure.clear();
++			return RemoteDeterminismStatus();
++		}
++		if (action == "STOP") {
++			remote_determinism_mode = REMOTE_DETERMINISM_OFF;
++			DEBUG_determinism_active = false;
++			return RemoteDeterminismStatus();
++		}
++		if (action == "RECORD") {
++			if (!remote_replay_active) return "ERR CHECKPOINT_REQUIRED";
++			if (sync_time) return "ERR HOST_TIME_SYNCHRONIZATION_ENABLED";
++			remote_determinism_events.clear();
++			remote_determinism_log_valid = true;
++			remote_determinism_cursor = 0;
++			remote_determinism_bytes = 0;
++			remote_determinism_failed = false;
++			remote_determinism_failure.clear();
++			remote_fileio_offsets.clear();
++			remote_determinism_mode = REMOTE_DETERMINISM_RECORD;
++			DEBUG_determinism_active = true;
++			return RemoteDeterminismStatus();
++		}
++		if (action == "VERIFY") {
++			if (!remote_replay_active) return "ERR CHECKPOINT_REQUIRED";
++			if (sync_time) return "ERR HOST_TIME_SYNCHRONIZATION_ENABLED";
++			if (!remote_determinism_log_valid)
++				return "ERR DETERMINISM_LOG_EMPTY";
++			remote_determinism_cursor = 0;
++			while (remote_determinism_cursor < remote_determinism_events.size() &&
++			       remote_determinism_events[remote_determinism_cursor].sequence <
++			               remote_replay_sequence)
++				++remote_determinism_cursor;
++			remote_determinism_failed = false;
++			remote_determinism_failure.clear();
++			remote_fileio_offsets.clear();
++			remote_determinism_mode = REMOTE_DETERMINISM_VERIFY;
++			DEBUG_determinism_active = true;
++			return RemoteDeterminismStatus();
++		}
++		return "ERR USAGE DEBUG DETERMINISM <STATUS|RECORD|VERIFY|STOP|CLEAR>";
++	}
++
+ 	if (command == "REGISTERS") return RemoteRegisterState();
+ 
+ 	if (command == "FILEIO") {
+@@ -6414,13 +6766,13 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 					return "ERR FILEIO_CAPACITY_RANGE_16_1024";
+ 				capacity = static_cast<size_t>(parsed);
+ 			}
++			if (!remote_api_trace_active) remote_observer_instruction_sequence = 0;
+ 			remote_fileio_active = false;
+ 			remote_fileio_events.clear();
+ 			remote_fileio_offsets.clear();
+ 			remote_fileio_capacity = capacity;
+ 			remote_fileio_next_sequence = 0;
+ 			remote_fileio_dropped = 0;
+-			if (!remote_api_trace_active) remote_observer_instruction_sequence = 0;
+ 			remote_fileio_active = true;
+ 			return RemoteFileIoStatus();
+ 		}
+@@ -6492,13 +6844,13 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 				if (probes.size() > 32U) return "ERR APITRACE_PROBE_COUNT_RANGE_1_32";
+ 			}
+ 			if (probes.empty()) return "ERR APITRACE_PROBE_COUNT_RANGE_1_32";
++			if (!remote_fileio_active) remote_observer_instruction_sequence = 0;
+ 			remote_api_trace_active = false;
+ 			remote_api_trace_events.clear();
+ 			remote_api_trace_probes = probes;
+ 			remote_api_trace_capacity = static_cast<size_t>(capacity);
+ 			remote_api_trace_next_sequence = 0;
+ 			remote_api_trace_dropped = 0;
+-			if (!remote_fileio_active) remote_observer_instruction_sequence = 0;
+ 			remote_api_trace_active = true;
+ 			return RemoteApiTraceStatus();
+ 		}
+@@ -8938,6 +9290,10 @@ void DEBUG_HeavyWriteLogInstruction(void) {
+ bool DEBUG_HeavyIsBreakpoint(void) {
+ 	if (remote_fileio_active || remote_api_trace_active)
+ 		++remote_observer_instruction_sequence;
++	if (remote_determinism_failed) {
++		remote_debug_enabled.store(true);
++		return true;
++	}
+ 	if (remote_watch_pending.exchange(false)) {
+ 		remote_debug_enabled.store(true);
+ 		return true;
+diff --git a/src/dos/dos.cpp b/src/dos/dos.cpp
+index 0bfe34b..270b11c 100644
+--- a/src/dos/dos.cpp
++++ b/src/dos/dos.cpp
+@@ -5874,6 +5874,9 @@ namespace
+ 
+ 				// - pure data
+ 				WRITE_POD( &dos.firstMCB, dos.firstMCB );
++				WRITE_POD( &dos.date.year, dos.date.year );
++				WRITE_POD( &dos.date.month, dos.date.month );
++				WRITE_POD( &dos.date.day, dos.date.day );
+ 				WRITE_POD( &dos.errorcode, dos.errorcode );
+ 				//WRITE_POD( &dos.env, dos.env );
+ 				//WRITE_POD( &dos.cpmentry, dos.cpmentry );
+@@ -5916,6 +5919,9 @@ namespace
+ 
+ 				// - pure data
+ 				READ_POD( &dos.firstMCB, dos.firstMCB );
++				READ_POD( &dos.date.year, dos.date.year );
++				READ_POD( &dos.date.month, dos.date.month );
++				READ_POD( &dos.date.day, dos.date.day );
+ 				READ_POD( &dos.errorcode, dos.errorcode );
+ 				//READ_POD( &dos.env, dos.env );
+ 				//READ_POD( &dos.cpmentry, dos.cpmentry );
+diff --git a/src/dos/dos_files.cpp b/src/dos/dos_files.cpp
+index eff34ce..cf3c97c 100644
+--- a/src/dos/dos_files.cpp
++++ b/src/dos/dos_files.cpp
+@@ -71,7 +71,8 @@ public:
+ 	          path(path_value ? path_value : ""),
+ 	          path2(path2_value ? path2_value : ""), success(false),
+ 	          requested(0), actual(0), seek_origin(UINT32_MAX),
+-	          seek_argument(UINT32_MAX), seek_result(UINT32_MAX) {}
++	          seek_argument(UINT32_MAX), seek_result(UINT32_MAX),
++	          read_data(NULL), read_data_count(0) {}
+ 
+ 	~DOSFileIoObservation()
+ 	{
+@@ -80,7 +81,8 @@ public:
+ 		                    system_handle, fcb, path.empty() ? NULL : path.c_str(),
+ 		                    path2.empty() ? NULL : path2.c_str(), success,
+ 		                    success ? 0 : dos.errorcode, requested, actual,
+-		                    seek_origin, seek_argument, seek_result);
++		                    seek_origin, seek_argument, seek_result,
++		                    read_data, read_data_count);
+ 	}
+ 
+ 	DEBUG_FileIoOperation operation;
+@@ -100,6 +102,8 @@ public:
+ 	uint32_t seek_origin;
+ 	uint32_t seek_argument;
+ 	uint32_t seek_result;
++	const uint8_t *read_data;
++	uint32_t read_data_count;
+ };
+ 
+ #if defined(__APPLE__) && defined(__MAC_OS_X_VERSION_MIN_REQUIRED) && __MAC_OS_X_VERSION_MIN_REQUIRED < 101200
+@@ -872,6 +876,10 @@ bool DOS_ReadFile(uint16_t entry,uint8_t * data,uint16_t * amount,bool fcb) {
+     if(Network_IsActiveResource(entry)) {
+ 		observation.success = Network_ReadFile(entry,data,amount);
+ 		observation.actual = *amount;
++		if (observation.success) {
++			observation.read_data = data;
++			observation.read_data_count = *amount;
++		}
+ 		return observation.success;
+ 	}
+  #endif
+@@ -896,6 +904,10 @@ bool DOS_ReadFile(uint16_t entry,uint8_t * data,uint16_t * amount,bool fcb) {
+ 	*amount=toread;
+ 	observation.success=ret;
+ 	observation.actual=toread;
++	if (ret) {
++		observation.read_data = data;
++		observation.read_data_count = toread;
++	}
+ 	return ret;
+ }
+ 
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index cab5687..172404c 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -142,7 +142,7 @@ static std::string handle_command(const std::string& cmd) {
+                DOSBOX_X_BUILD_ID
+                " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
+ #if C_DEBUG
+-               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,SNAPSHOT,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,COVERAGE,CHECKPOINT,HASH,INPUT,WAIT,CONTINUE"
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,SNAPSHOT,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,COVERAGE,CHECKPOINT,HASH,INPUT,DETERMINISM,WAIT,CONTINUE"
+ #else
+                " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
+ #endif
+diff --git a/src/hardware/cmos.cpp b/src/hardware/cmos.cpp
+index 501840f..badca2d 100644
+--- a/src/hardware/cmos.cpp
++++ b/src/hardware/cmos.cpp
+@@ -579,6 +579,21 @@ public:
+         registerPOD(cmos.timer.div);
+         registerPOD(cmos.timer.delay);
+         registerPOD(cmos.timer.acknowledged);
++        registerPOD(cmos.clock.sec);
++        registerPOD(cmos.clock.min);
++        registerPOD(cmos.clock.hour);
++        registerPOD(cmos.clock.weekday);
++        registerPOD(cmos.clock.day);
++        registerPOD(cmos.clock.month);
++        registerPOD(cmos.clock.year);
++        registerPOD(cmos.alarm.sec);
++        registerPOD(cmos.alarm.min);
++        registerPOD(cmos.alarm.hour);
++        registerPOD(cmos.clock_time_t);
++        registerPOD(cmos_sync_flag);
++        registerPOD(cmos_sync_sec);
++        registerPOD(cmos_sync_min);
++        registerPOD(cmos_sync_hour);
+         registerPOD(cmos.last.ended);
+     }
+ } dummy;
+diff --git a/src/hardware/pic.cpp b/src/hardware/pic.cpp
+index d199b7e..647f214 100644
+--- a/src/hardware/pic.cpp
++++ b/src/hardware/pic.cpp
+@@ -27,6 +27,7 @@
+ #include "timer.h"
+ #include "setup.h"
+ #include "control.h"
++#include "debug.h"
+ 
+ #if defined(_MSC_VER)
+ # pragma warning(disable:4244) /* const fmath::local::uint64_t to double possible loss of data */
+@@ -528,14 +529,51 @@ static void slave_startIRQ(){
+         return;
+     }
+ 
++	const uint8_t vector = static_cast<uint8_t>(slave.vector_base + pic1_irq);
++	if (DEBUG_determinism_active &&
++	    DEBUG_DeterminismInterruptDecision(vector, false) <= 0) return;
+     slave.start_irq(pic1_irq);
+     master.start_irq(master_cascade_irq);
+-    CPU_HW_Interrupt((unsigned int)slave.vector_base + (unsigned int)pic1_irq);
++    CPU_HW_Interrupt(vector);
+ }
+ 
+ static void inline master_startIRQ(Bitu i){
++	const uint8_t vector = static_cast<uint8_t>(master.vector_base + i);
++	if (DEBUG_determinism_active &&
++	    DEBUG_DeterminismInterruptDecision(vector, false) <= 0) return;
+     master.start_irq(i);
+-    CPU_HW_Interrupt(master.vector_base + i);
++    CPU_HW_Interrupt(vector);
++}
++
++bool PIC_ReplayInterrupt(uint8_t vector, bool nmi)
++{
++	if (nmi) {
++		/* Replay bypasses CPU_NMI_Interrupt's live-delivery observer because the
++		 * retained NMI event has already been validated and consumed here. */
++		if (CPU_NMI_active || !CPU_NMI_pending) return false;
++		CPU_NMI_active = true;
++		CPU_NMI_pending = false;
++		CPU_Interrupt(2, 0, reg_eip);
++		return true;
++	}
++	if (vector >= slave.vector_base && vector < slave.vector_base + 8U) {
++		const uint8_t irq = static_cast<uint8_t>(vector - slave.vector_base);
++		const uint8_t bit = static_cast<uint8_t>(1U << irq);
++		const uint8_t cascade_bit = static_cast<uint8_t>(1U << master_cascade_irq);
++		if (!(slave.irr & bit) || !(master.irr & cascade_bit)) return false;
++		slave.start_irq(irq);
++		master.start_irq(master_cascade_irq);
++		CPU_HW_Interrupt(vector);
++		return true;
++	}
++	if (vector >= master.vector_base && vector < master.vector_base + 8U) {
++		const uint8_t irq = static_cast<uint8_t>(vector - master.vector_base);
++		if (!(master.irr & static_cast<uint8_t>(1U << irq))) return false;
++		master.start_irq(irq);
++		CPU_HW_Interrupt(vector);
++		return true;
++	}
++	return false;
+ }
+ 
+ void PIC_runIRQs(void) {
+@@ -1466,4 +1504,3 @@ private:
+     }
+ } dummy;
+ }
+-

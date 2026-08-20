@@ -1,0 +1,343 @@
+From b4708ada982fd6e5b5482d011caace1a96229b13 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 21:39:21 -0400
+Subject: [PATCH 14/19] feat(debugger): capture bounded code coverage
+
+---
+ src/debug/debug.cpp | 274 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 274 insertions(+)
+
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index c642891..a33d2c5 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -544,6 +544,44 @@ static std::vector<RemoteApiTraceProbe> remote_api_trace_probes;
+ static std::deque<RemoteApiTraceEvent> remote_api_trace_events;
+ static CPU_Decoder *remote_api_trace_saved_decoder = NULL;
+ 
++/* Code coverage is deliberately an address collector, not a disassembler.
++ * A reviewed host plan gives exact Win16 basic-block boundaries meaning; the
++ * emulator only records which instruction addresses actually executed inside
++ * one selector range. This avoids guessing functions or phases in DOSBox-X. */
++struct RemoteCoverageEntry {
++	uint64_t epoch;
++	uint32_t offset;
++	uint64_t first_sequence;
++	uint64_t last_sequence;
++	uint64_t hits;
++};
++
++struct RemoteCoverageEpoch {
++	uint64_t id;
++	uint16_t selector;
++	uint32_t base;
++	uint32_t limit;
++	uint64_t signature;
++	bool signature_valid;
++};
++
++static bool remote_coverage_active = false;
++static bool remote_coverage_any_selector = false;
++static uint16_t remote_coverage_selector = 0;
++static uint32_t remote_coverage_start = 0;
++static uint32_t remote_coverage_end = 0;
++static uint32_t remote_coverage_signature_count = 32;
++static size_t remote_coverage_capacity = 256;
++static uint64_t remote_coverage_next_sequence = 0;
++static uint64_t remote_coverage_dropped = 0;
++static uint64_t remote_coverage_lifecycle = 0;
++static size_t remote_coverage_reported = 0;
++static std::vector<RemoteCoverageEntry> remote_coverage_entries;
++static std::vector<RemoteCoverageEpoch> remote_coverage_epochs;
++static std::map<uint16_t, size_t> remote_coverage_current_epochs;
++static std::map<std::pair<uint64_t, uint32_t>, size_t> remote_coverage_indexes;
++static CPU_Decoder *remote_coverage_saved_decoder = NULL;
++
+ static const char *RemoteFileIoOperationName(DEBUG_FileIoOperation operation)
+ {
+ 	switch (operation) {
+@@ -5510,6 +5548,132 @@ static void RemoteApiTraceObserve(void)
+ 	}
+ }
+ 
++static std::string RemoteCoverageStatus(void)
++{
++	std::ostringstream out;
++	out << "OK ACTIVE=" << (remote_coverage_active ? 1 : 0)
++	    << " LIFECYCLE=" << remote_coverage_lifecycle
++	    << " SELECTOR=";
++	if (remote_coverage_any_selector) out << "ANY";
++	else out << std::hex << std::uppercase << std::setfill('0')
++	         << std::setw(4) << remote_coverage_selector;
++	out << " START=" << std::hex << std::uppercase << std::setfill('0')
++	    << std::setw(8) << remote_coverage_start
++	    << " END=" << std::setw(8) << remote_coverage_end
++	    << std::dec << " SIGNATURE_COUNT=" << remote_coverage_signature_count
++	    << " CAPACITY=" << remote_coverage_capacity
++	    << " UNIQUE=" << remote_coverage_entries.size()
++	    << " QUEUED=" << (remote_coverage_entries.size() - remote_coverage_reported)
++	    << " DROPPED=" << remote_coverage_dropped
++	    << " NEXT=" << remote_coverage_next_sequence
++	    << " BOUNDARY=BEFORE_EXECUTION";
++	return out.str();
++}
++
++static std::string RemoteCoverageDrain(size_t count)
++{
++	const size_t available = remote_coverage_entries.size() - remote_coverage_reported;
++	const size_t drained = std::min(count, available);
++	std::ostringstream out;
++	out << "OK COUNT=" << drained
++	    << " ACTIVE=" << (remote_coverage_active ? 1 : 0)
++	    << " LIFECYCLE=" << remote_coverage_lifecycle
++	    << " DROPPED=" << remote_coverage_dropped;
++	for (size_t index = 0; index < drained; ++index) {
++		const RemoteCoverageEntry &entry =
++		        remote_coverage_entries[remote_coverage_reported++];
++		const RemoteCoverageEpoch &epoch = remote_coverage_epochs[entry.epoch - 1U];
++		out << "\nFIRST=" << entry.first_sequence
++		    << " LAST=" << entry.last_sequence
++		    << " SITE=" << std::hex << std::uppercase << std::setfill('0')
++		    << std::setw(4) << epoch.selector << ":"
++		    << std::setw(8) << entry.offset << std::dec
++		    << " EPOCH=" << epoch.id << " BASE=" << std::hex
++		    << std::uppercase << std::setfill('0') << std::setw(8) << epoch.base
++		    << " LIMIT=" << std::setw(8) << epoch.limit << " SIGNATURE=";
++		if (epoch.signature_valid)
++			out << "FNV1A64:" << std::setw(16) << epoch.signature;
++		else out << "INVALID";
++		out << std::dec
++		    << " HITS=" << entry.hits;
++	}
++	return out.str();
++}
++
++/** Record the instruction about to execute when it lies inside the declared
++ * selector range. The normal core calls DEBUG_HeavyIsBreakpoint at this exact
++ * boundary. Coverage never stops the guest and never reads guest memory. */
++static void RemoteCoverageObserve(void)
++{
++	if (!remote_coverage_active) return;
++	const uint64_t sequence = remote_coverage_next_sequence++;
++	if ((!remote_coverage_any_selector && SegValue(cs) != remote_coverage_selector) ||
++	    reg_eip < remote_coverage_start ||
++	    reg_eip >= remote_coverage_end)
++		return;
++	Descriptor descriptor;
++	const uint16_t selector = SegValue(cs);
++	if (!cpu.gdt.GetDescriptor(selector, descriptor) || descriptor.Type() == 0) {
++		++remote_coverage_dropped;
++		return;
++	}
++	const uint32_t base = descriptor.GetBase();
++	const uint32_t limit = descriptor.GetLimit();
++	size_t epoch_index = 0;
++	const auto current = remote_coverage_current_epochs.find(selector);
++	if (current == remote_coverage_current_epochs.end() ||
++	    remote_coverage_epochs[current->second].base != base ||
++	    remote_coverage_epochs[current->second].limit != limit) {
++		if (remote_coverage_epochs.size() >= remote_coverage_capacity) {
++			++remote_coverage_dropped;
++			return;
++		}
++		RemoteCoverageEpoch epoch;
++		epoch.id = remote_coverage_epochs.size() + 1U;
++		epoch.selector = selector;
++		epoch.base = base;
++		epoch.limit = limit;
++		epoch.signature = UINT64_C(14695981039346656037);
++		const uint32_t signature_end = remote_coverage_start + remote_coverage_signature_count;
++		epoch.signature_valid = signature_end - 1U <= limit &&
++		        base <= UINT32_MAX - (signature_end - 1U);
++		for (uint32_t offset = remote_coverage_start;
++		     epoch.signature_valid && offset < signature_end; ++offset) {
++			uint8_t value = 0;
++			if (mem_readb_checked(static_cast<PhysPt>(base + offset), &value)) {
++				epoch.signature_valid = false;
++				break;
++			}
++			epoch.signature ^= value;
++			epoch.signature *= UINT64_C(1099511628211);
++		}
++		epoch_index = remote_coverage_epochs.size();
++		remote_coverage_epochs.push_back(epoch);
++		remote_coverage_current_epochs[selector] = epoch_index;
++	} else epoch_index = current->second;
++	const uint64_t epoch_id = remote_coverage_epochs[epoch_index].id;
++	const auto key = std::make_pair(epoch_id, reg_eip);
++	const auto known = remote_coverage_indexes.find(key);
++	if (known != remote_coverage_indexes.end()) {
++		RemoteCoverageEntry &entry = remote_coverage_entries[known->second];
++		entry.last_sequence = sequence;
++		++entry.hits;
++		return;
++	}
++	if (remote_coverage_entries.size() >= remote_coverage_capacity) {
++		++remote_coverage_dropped;
++		return;
++	}
++	RemoteCoverageEntry entry;
++	entry.epoch = epoch_id;
++	entry.offset = reg_eip;
++	entry.first_sequence = sequence;
++	entry.last_sequence = sequence;
++	entry.hits = 1;
++	remote_coverage_indexes[key] = remote_coverage_entries.size();
++	remote_coverage_entries.push_back(entry);
++}
++
+ static std::string RemoteWin16Stack(uint32_t count)
+ {
+ 	if (!count || count > 64U) return "ERR STACK_COUNT_RANGE_1_64";
+@@ -6213,6 +6377,8 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		if (action == "START") {
+ 			if (!remote_watchpoints.empty())
+ 				return "ERR APITRACE_INCOMPATIBLE_WITH_WATCHPOINTS";
++			if (remote_coverage_active)
++				return "ERR APITRACE_INCOMPATIBLE_WITH_COVERAGE";
+ 			std::string capacity_text;
+ 			input >> capacity_text;
+ 			char *end = NULL;
+@@ -6280,6 +6446,103 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		return "ERR USAGE DEBUG APITRACE (START|STATUS|DRAIN|STOP|CLEAR)";
+ 	}
+ 
++	if (command == "COVERAGE") {
++		std::string action;
++		input >> action;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "STATUS") {
++			std::string extra;
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG COVERAGE STATUS";
++			return RemoteCoverageStatus();
++		}
++		if (action == "START") {
++			if (!remote_watchpoints.empty())
++				return "ERR COVERAGE_INCOMPATIBLE_WITH_WATCHPOINTS";
++			if (remote_api_trace_active)
++				return "ERR COVERAGE_INCOMPATIBLE_WITH_APITRACE";
++			std::string selector_text, start_text, end_text, capacity_text;
++			std::string signature_count_text, extra;
++			input >> selector_text >> start_text >> end_text >> capacity_text >>
++			        signature_count_text >> extra;
++			for (auto &ch : selector_text) ch = static_cast<char>(toupper(ch));
++			const bool any_selector = selector_text == "ANY";
++			uint32_t selector = 0, start = 0, end = 0;
++			char *capacity_end = NULL;
++			const unsigned long capacity = strtoul(capacity_text.c_str(), &capacity_end, 10);
++			char *signature_count_end = NULL;
++			const unsigned long signature_count =
++			        strtoul(signature_count_text.c_str(), &signature_count_end, 10);
++			if ((!any_selector && (!RemoteParseHex(selector_text, selector) || selector > 0xffffU)) ||
++			    !RemoteParseHex(start_text, start) || !RemoteParseHex(end_text, end) ||
++			    start >= end || static_cast<uint64_t>(end) - start > 0x10000ULL ||
++			    capacity_text.empty() || !capacity_end || *capacity_end != '\0' ||
++			    capacity < 16UL || capacity > 65536UL || signature_count_text.empty() ||
++			    !signature_count_end || *signature_count_end != '\0' || signature_count < 8UL ||
++			    signature_count > 256UL || signature_count > end - start || !extra.empty())
++				return "ERR USAGE DEBUG COVERAGE START <selector-hex|ANY> <start-hex> <end-exclusive-hex> <capacity-16-65536> <signature-count-8-256>";
++			const uint64_t first = any_selector ? 0 : GetAddress(static_cast<uint16_t>(selector), start);
++			const uint64_t last = any_selector ? end - start - 1U :
++			        GetAddress(static_cast<uint16_t>(selector), end - 1U);
++			if (!any_selector && (first == mem_no_address || last == mem_no_address ||
++			    last - first != static_cast<uint64_t>(end - start - 1U))
++				)
++				return "ERR COVERAGE_INVALID_SELECTOR_RANGE";
++			remote_coverage_active = false;
++			remote_coverage_any_selector = any_selector;
++			remote_coverage_selector = static_cast<uint16_t>(selector);
++			remote_coverage_start = start;
++			remote_coverage_end = end;
++			remote_coverage_signature_count = static_cast<uint32_t>(signature_count);
++			remote_coverage_capacity = static_cast<size_t>(capacity);
++			remote_coverage_next_sequence = 0;
++			remote_coverage_dropped = 0;
++			remote_coverage_reported = 0;
++			remote_coverage_entries.clear();
++			remote_coverage_indexes.clear();
++			remote_coverage_epochs.clear();
++			remote_coverage_current_epochs.clear();
++			++remote_coverage_lifecycle;
++			remote_coverage_active = true;
++			return RemoteCoverageStatus();
++		}
++		if (action == "STOP") {
++			std::string extra;
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG COVERAGE STOP";
++			remote_coverage_active = false;
++			return RemoteCoverageStatus();
++		}
++		if (action == "CLEAR") {
++			std::string extra;
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG COVERAGE CLEAR";
++			remote_coverage_entries.clear();
++			remote_coverage_indexes.clear();
++			remote_coverage_epochs.clear();
++			remote_coverage_current_epochs.clear();
++			remote_coverage_reported = 0;
++			remote_coverage_next_sequence = 0;
++			remote_coverage_dropped = 0;
++			return RemoteCoverageStatus();
++		}
++		if (action == "DRAIN") {
++			std::string count_text, extra;
++			input >> count_text >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG COVERAGE DRAIN [count]";
++			size_t count = 64;
++			if (!count_text.empty()) {
++				char *end = NULL;
++				const unsigned long parsed = strtoul(count_text.c_str(), &end, 10);
++				if (!end || *end != '\0' || parsed < 1UL || parsed > 256UL)
++					return "ERR COVERAGE_DRAIN_RANGE_1_256";
++				count = static_cast<size_t>(parsed);
++			}
++			return RemoteCoverageDrain(count);
++		}
++		return "ERR USAGE DEBUG COVERAGE (START|STATUS|DRAIN|STOP|CLEAR)";
++	}
++
+ 	if (command == "MUTATE") {
+ 		static const std::string confirmation = "CONFIRM_MANIPULATED_ORACLE";
+ 		std::string target;
+@@ -6513,6 +6776,8 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		if (action == "ADD") {
+ 			if (remote_api_trace_active)
+ 				return "ERR WATCH_INCOMPATIBLE_WITH_APITRACE";
++			if (remote_coverage_active)
++				return "ERR WATCH_INCOMPATIBLE_WITH_COVERAGE";
+ 			std::string mode_text, address_text, length_text, option, extra;
+ 			input >> mode_text >> address_text >> length_text >> option >> extra;
+ 			for (auto &ch : mode_text) ch = static_cast<char>(toupper(ch));
+@@ -6737,6 +7002,10 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			remote_api_trace_saved_decoder = cpudecoder;
+ 			cpudecoder = &CPU_Core_Normal_Run;
+ 		}
++		if (remote_coverage_active && cpudecoder != &CPU_Core_Normal_Run) {
++			remote_coverage_saved_decoder = cpudecoder;
++			cpudecoder = &CPU_Core_Normal_Run;
++		}
+ 		DOSBOX_SetNormalLoop();
+ 		resume = true;
+ 		return "OK RUNNING";
+@@ -6755,6 +7024,10 @@ static Bitu RemoteDebuggerLoop(void)
+ 		cpudecoder = remote_api_trace_saved_decoder;
+ 		remote_api_trace_saved_decoder = NULL;
+ 	}
++	if (remote_coverage_saved_decoder) {
++		cpudecoder = remote_coverage_saved_decoder;
++		remote_coverage_saved_decoder = NULL;
++	}
+ 	CBreakpoint::DeactivateBreakpoints();
+ 	{
+ 		std::lock_guard<std::mutex> lock(remote_debug_mutex);
+@@ -8578,6 +8851,7 @@ bool DEBUG_HeavyIsBreakpoint(void) {
+ 		return true;
+ 	}
+ 	RemoteApiTraceObserve();
++	RemoteCoverageObserve();
+ 	if (cpuLog) {
+ 		if (cpuLogCounter>0) {
+ 			LogInstruction(SegValue(cs),reg_eip,cpuLogFile);

@@ -18,7 +18,7 @@ In TSR mode (`/T` flag), it returns to DOS after installation — other programs
 
 ```bash
 make                  # Assemble DOSMCP.COM (requires nasm)
-make test             # Build + run 153 tests in emu2 (headless, TSR mode)
+make test             # Build + run 154 tests in emu2 (headless, TSR mode)
 make testgui          # Build + run tests in DOSBox-X (needs display, TSR mode)
 ```
 
@@ -35,7 +35,7 @@ The argument specifies the drive letter where `_MAGIC_/` lives.
 
 All commands are plain text written to `__MCP__.TX`. Responses appear in `__MCP__.RX`.
 
-Parameters in `<angle brackets>` are required. Parameters in `[square brackets]` are optional. Hex values are written without prefix (e.g., `0040` not `0x0040`). Version: MCP/0.10.
+Parameters in `<angle brackets>` are required. Parameters in `[square brackets]` are optional. Hex values are written without prefix (e.g., `0040` not `0x0040`). Version: MCP/0.11.
 
 ---
 
@@ -44,8 +44,9 @@ Parameters in `<angle brackets>` are required. Parameters in `[square brackets]`
 | Command | Response | Description |
 |---|---|---|
 | `META PING` | `OK PONG` | Liveness check |
-| `META VERSION` | `OK MCP/0.10 META,MEM,...` | Version and capability list |
-| `META STATUS` | `OK V0.10 CMDS=42 DEBUG=0 POLL=9 TIMEOUT=36` | Runtime stats |
+| `META IDENTITY` | `OK TOOL=DOSMCP PROTOCOL=... BUILD=... FEATURES=...` | Source-derived build identity and exact capabilities |
+| `META VERSION` | `OK MCP/0.11 META,MEM,...` | Version and capability list |
+| `META STATUS` | `OK V0.11 CMDS=42 DEBUG=0 POLL=9 TIMEOUT=36` | Runtime stats |
 | `META HEARTBEAT` | `OK` | Reset watchdog timer |
 | `META LOG ON` | `OK` | Enable debug logging |
 | `META LOG OFF` | `OK` | Disable debug logging |
@@ -392,4 +393,4 @@ Note: Clipboard requires Windows enhanced mode. Returns `ERR CLIPBOARD_UNAVAILAB
 - **INT 2Fh multiplex:** Responds to AH=C0h for installation detection (prevents double-install).
 - **Memory layout:** Resident code, data, BSS, and stack are packed first. Initialization code lives past `resident_end` and is discarded after TSR install.
 - **8086 compatible:** No 286+ instructions. Runs on any x86 processor.
-- **22 command families, 80+ individual commands, 153 passing tests.**
+- **22 command families, 80+ individual commands, 154 passing tests.**

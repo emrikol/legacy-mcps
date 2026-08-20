@@ -1,0 +1,370 @@
+From 01c61aafac0dac004bda6e78dbc8b7e9f8748277 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Tue, 18 Aug 2026 05:00:00 -0400
+Subject: [PATCH 18/19] feat(debugger): defer logical NE API probes
+
+---
+ src/debug/debug.cpp               | 257 +++++++++++++++++++++++++++++-
+ src/gui/dosbox_control_server.cpp |   2 +-
+ 2 files changed, 255 insertions(+), 4 deletions(-)
+
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index 3bedf94..be2b5b0 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -652,6 +652,31 @@ struct RemoteApiTraceProbe {
+ 	uint32_t stack_bytes;
+ };
+ 
++enum RemoteApiTraceMode {
++	REMOTE_API_TRACE_FIXED,
++	REMOTE_API_TRACE_LOGICAL
++};
++
++struct RemoteApiTraceLogicalProbe {
++	unsigned int id;
++	uint16_t logical_segment;
++	uint32_t offset;
++	uint32_t stack_bytes;
++	uint32_t limit;
++	uint32_t signature_offset;
++	uint32_t signature_length;
++	uint64_t signature;
++};
++
++struct RemoteApiTraceLogicalBinding {
++	bool valid = false;
++	uint16_t selector = 0;
++	uint32_t base = 0;
++	uint32_t limit = 0;
++	uint64_t signature = 0;
++	uint64_t epoch = 0;
++};
++
+ struct RemoteApiTraceEvent {
+ 	uint64_t sequence;
+ 	uint64_t instruction_sequence;
+@@ -662,13 +687,22 @@ struct RemoteApiTraceEvent {
+ 	uint32_t esp;
+ 	bool stack_valid;
+ 	std::vector<uint8_t> stack;
++	bool logical;
++	uint16_t logical_segment;
++	uint64_t binding_epoch;
++	uint32_t binding_base;
++	uint32_t binding_limit;
++	uint64_t binding_signature;
+ };
+ 
+ static bool remote_api_trace_active = false;
++static RemoteApiTraceMode remote_api_trace_mode = REMOTE_API_TRACE_FIXED;
+ static size_t remote_api_trace_capacity = 256;
+ static uint64_t remote_api_trace_next_sequence = 0;
+ static uint64_t remote_api_trace_dropped = 0;
+ static std::vector<RemoteApiTraceProbe> remote_api_trace_probes;
++static std::vector<RemoteApiTraceLogicalProbe> remote_api_trace_logical_probes;
++static std::map<uint16_t, RemoteApiTraceLogicalBinding> remote_api_trace_bindings;
+ static std::deque<RemoteApiTraceEvent> remote_api_trace_events;
+ static CPU_Decoder *remote_api_trace_saved_decoder = NULL;
+ 
+@@ -5736,7 +5770,9 @@ static std::string RemoteApiTraceStatus(void)
+ 	std::ostringstream out;
+ 	out << "OK ACTIVE=" << (remote_api_trace_active ? 1 : 0)
+ 	    << " CAPACITY=" << remote_api_trace_capacity
+-	    << " PROBES=" << remote_api_trace_probes.size()
++	    << " PROBES=" << (remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL ?
++	                       remote_api_trace_logical_probes.size() :
++	                       remote_api_trace_probes.size())
+ 	    << " QUEUED=" << remote_api_trace_events.size()
+ 	    << " DROPPED=" << remote_api_trace_dropped
+ 	    << " NEXT=" << remote_api_trace_next_sequence;
+@@ -5766,6 +5802,15 @@ static std::string RemoteApiTraceDrain(size_t count)
+ 			for (const auto byte : event.stack)
+ 				out << std::setw(2) << static_cast<unsigned int>(byte);
+ 		}
++		if (event.logical) {
++			out << " LSEG=" << std::setw(4) << event.logical_segment
++			    << std::dec << " EPOCH=" << event.binding_epoch
++			    << " BASE=" << std::hex << std::uppercase << std::setfill('0')
++			    << std::setw(8) << event.binding_base
++			    << " LIMIT=" << std::setw(8) << event.binding_limit
++			    << " SIGNATURE=FNV1A64:" << std::setw(16)
++			    << event.binding_signature;
++		}
+ 		out << std::dec;
+ 		remote_api_trace_events.pop_front();
+ 	}
+@@ -5796,6 +5841,58 @@ static bool RemoteApiTraceParseProbe(const std::string &text,
+ 	return true;
+ }
+ 
++static bool RemoteApiTraceParseHex64(const std::string &text, uint64_t &value)
++{
++	if (text.size() != 16U) return false;
++	value = 0;
++	for (const auto ch : text) {
++		uint8_t digit = 0;
++		if (ch >= '0' && ch <= '9') digit = static_cast<uint8_t>(ch - '0');
++		else if (ch >= 'A' && ch <= 'F') digit = static_cast<uint8_t>(ch - 'A' + 10);
++		else if (ch >= 'a' && ch <= 'f') digit = static_cast<uint8_t>(ch - 'a' + 10);
++		else return false;
++		value = (value << 4U) | digit;
++	}
++	return true;
++}
++
++static bool RemoteApiTraceParseLogicalProbe(const std::string &text,
++                                            RemoteApiTraceLogicalProbe &probe)
++{
++	std::vector<std::string> fields;
++	size_t begin = 0;
++	while (true) {
++		const size_t end = text.find(':', begin);
++		fields.push_back(text.substr(begin, end - begin));
++		if (end == std::string::npos) break;
++		begin = end + 1U;
++	}
++	if (fields.size() != 8U) return false;
++	uint32_t id = 0, logical_segment = 0, offset = 0, stack_bytes = 0;
++	uint32_t limit = 0, signature_offset = 0, signature_length = 0;
++	uint64_t signature = 0;
++	if (!RemoteParseHex(fields[0], id) || !id || id > 0xffffU ||
++	    !RemoteParseHex(fields[1], logical_segment) || !logical_segment ||
++	    logical_segment > 0xffffU || !RemoteParseHex(fields[2], offset) ||
++	    !RemoteParseHex(fields[3], stack_bytes) || !stack_bytes || stack_bytes > 64U ||
++	    !RemoteParseHex(fields[4], limit) || offset > limit ||
++	    !RemoteParseHex(fields[5], signature_offset) ||
++	    !RemoteParseHex(fields[6], signature_length) || !signature_length ||
++	    signature_length > 256U || signature_offset > limit ||
++	    signature_length - 1U > limit - signature_offset ||
++	    !RemoteApiTraceParseHex64(fields[7], signature))
++		return false;
++	probe.id = static_cast<unsigned int>(id);
++	probe.logical_segment = static_cast<uint16_t>(logical_segment);
++	probe.offset = offset;
++	probe.stack_bytes = stack_bytes;
++	probe.limit = limit;
++	probe.signature_offset = signature_offset;
++	probe.signature_length = signature_length;
++	probe.signature = signature;
++	return true;
++}
++
+ static bool RemoteReadSelectorWord(uint16_t selector, uint32_t offset,
+                                    uint16_t &value)
+ {
+@@ -5810,9 +5907,102 @@ static bool RemoteReadSelectorWord(uint16_t selector, uint32_t offset,
+ static void RemoteApiTraceObserve(void)
+ {
+ 	if (!remote_api_trace_active) return;
++	if (remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL) {
++		if (!cpu.pmode || (reg_flags & FLAG_VM)) return;
++		const uint16_t selector = SegValue(cs);
++		const uint32_t base = SegPhys(cs);
++		const uint32_t limit = SegLimit(cs);
++		bool has_address_candidate = false;
++		for (const auto &probe : remote_api_trace_logical_probes) {
++			if (probe.limit == limit && probe.offset == reg_eip)
++				has_address_candidate = true;
++		}
++		if (!has_address_candidate) return;
++		if (static_cast<uint64_t>(base) + limit > UINT32_MAX) {
++			++remote_api_trace_dropped;
++			return;
++		}
++		std::map<uint16_t, uint64_t> matches;
++		std::set<uint16_t> evaluated;
++		for (const auto &probe : remote_api_trace_logical_probes) {
++			if (probe.limit != limit || !evaluated.insert(probe.logical_segment).second)
++				continue;
++			uint64_t signature = UINT64_C(14695981039346656037);
++			for (uint32_t index = 0; index < probe.signature_length; ++index) {
++				uint8_t value = 0;
++				if (mem_readb_checked(static_cast<PhysPt>(base + probe.signature_offset + index),
++				                      &value)) {
++					++remote_api_trace_dropped;
++					return;
++				}
++				signature ^= value;
++				signature *= UINT64_C(1099511628211);
++			}
++			if (signature == probe.signature)
++				matches[probe.logical_segment] = signature;
++		}
++		if (matches.empty()) return;
++		if (matches.size() != 1U) {
++			++remote_api_trace_dropped;
++			return;
++		}
++		const uint16_t logical_segment = matches.begin()->first;
++		const uint64_t signature = matches.begin()->second;
++		RemoteApiTraceLogicalBinding &binding =
++		        remote_api_trace_bindings[logical_segment];
++		if (!binding.valid || binding.selector != selector || binding.base != base ||
++		    binding.limit != limit || binding.signature != signature) {
++			if (binding.epoch == UINT64_MAX) {
++				++remote_api_trace_dropped;
++				return;
++			}
++			binding.valid = true;
++			binding.selector = selector;
++			binding.base = base;
++			binding.limit = limit;
++			binding.signature = signature;
++			++binding.epoch;
++		}
++		for (const auto &probe : remote_api_trace_logical_probes) {
++			if (probe.logical_segment != logical_segment || probe.offset != reg_eip)
++				continue;
++			RemoteApiTraceEvent event = {};
++			event.sequence = remote_api_trace_next_sequence++;
++			event.instruction_sequence = remote_observer_instruction_sequence;
++			event.probe_id = probe.id;
++			event.cs = selector;
++			event.eip = reg_eip;
++			event.ss = SegValue(ss);
++			event.esp = cpu.stack.big ? reg_esp : (reg_esp & 0xffffU);
++			event.stack_valid = event.esp <= UINT32_MAX - (probe.stack_bytes - 1U);
++			event.stack.resize(probe.stack_bytes);
++			for (uint32_t index = 0; event.stack_valid && index < probe.stack_bytes; ++index) {
++				const uint64_t address = GetAddress(event.ss, event.esp + index);
++				if (address == mem_no_address ||
++				    mem_readb_checked(static_cast<PhysPt>(address), &event.stack[index])) {
++					event.stack_valid = false;
++					event.stack.clear();
++					break;
++				}
++			}
++			if (!event.stack_valid) event.stack.clear();
++			event.logical = true;
++			event.logical_segment = logical_segment;
++			event.binding_epoch = binding.epoch;
++			event.binding_base = base;
++			event.binding_limit = limit;
++			event.binding_signature = signature;
++			if (remote_api_trace_events.size() >= remote_api_trace_capacity) {
++				++remote_api_trace_dropped;
++				continue;
++			}
++			remote_api_trace_events.push_back(event);
++		}
++		return;
++	}
+ 	for (const auto &probe : remote_api_trace_probes) {
+ 		if (probe.selector != SegValue(cs) || probe.offset != reg_eip) continue;
+-		RemoteApiTraceEvent event;
++		RemoteApiTraceEvent event = {};
+ 		event.sequence = remote_api_trace_next_sequence++;
+ 		event.instruction_sequence = remote_observer_instruction_sequence;
+ 		event.probe_id = probe.id;
+@@ -5832,6 +6022,7 @@ static void RemoteApiTraceObserve(void)
+ 			}
+ 		}
+ 		if (!event.stack_valid) event.stack.clear();
++		event.logical = false;
+ 		if (remote_api_trace_events.size() >= remote_api_trace_capacity) {
+ 			++remote_api_trace_dropped;
+ 			continue;
+@@ -6845,6 +7036,7 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			}
+ 			if (probes.empty()) return "ERR APITRACE_PROBE_COUNT_RANGE_1_32";
+ 			if (!remote_fileio_active) remote_observer_instruction_sequence = 0;
++			remote_api_trace_mode = REMOTE_API_TRACE_FIXED;
+ 			remote_api_trace_active = false;
+ 			remote_api_trace_events.clear();
+ 			remote_api_trace_probes = probes;
+@@ -6854,6 +7046,63 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			remote_api_trace_active = true;
+ 			return RemoteApiTraceStatus();
+ 		}
++		if (action == "STARTLOGICAL") {
++			if (!remote_watchpoints.empty())
++				return "ERR APITRACE_INCOMPATIBLE_WITH_WATCHPOINTS";
++			if (remote_coverage_active)
++				return "ERR APITRACE_INCOMPATIBLE_WITH_COVERAGE";
++			std::string capacity_text;
++			input >> capacity_text;
++			char *end = NULL;
++			const unsigned long capacity = strtoul(capacity_text.c_str(), &end, 10);
++			if (capacity_text.empty() || !end || *end != '\0' ||
++			    capacity < 16UL || capacity > 8192UL)
++				return "ERR APITRACE_CAPACITY_RANGE_16_8192";
++			std::vector<RemoteApiTraceLogicalProbe> probes;
++			std::set<unsigned int> ids;
++			std::set<std::pair<uint16_t, uint32_t> > addresses;
++			std::map<uint16_t, RemoteApiTraceLogicalProbe> contracts;
++			std::map<uint64_t, uint16_t> signatures;
++			std::string token;
++			while (input >> token) {
++				RemoteApiTraceLogicalProbe probe;
++				if (!RemoteApiTraceParseLogicalProbe(token, probe))
++					return "ERR APITRACE_LOGICAL_PROBE ID:LSEG:OFFSET:STACK_BYTES_HEX:LIMIT:SIG_OFFSET:SIG_LENGTH:FNV64";
++				if (!ids.insert(probe.id).second)
++					return "ERR APITRACE_DUPLICATE_ID";
++				if (!addresses.insert(std::make_pair(probe.logical_segment,
++				                                             probe.offset)).second)
++					return "ERR APITRACE_DUPLICATE_LOGICAL_ADDRESS";
++				const auto known_contract = contracts.find(probe.logical_segment);
++				if (known_contract != contracts.end() &&
++				    (known_contract->second.limit != probe.limit ||
++				     known_contract->second.signature_offset != probe.signature_offset ||
++				     known_contract->second.signature_length != probe.signature_length ||
++				     known_contract->second.signature != probe.signature))
++					return "ERR APITRACE_LOGICAL_SEGMENT_CONTRACT_MISMATCH";
++				contracts[probe.logical_segment] = probe;
++				const auto known_signature = signatures.find(probe.signature);
++				if (known_signature != signatures.end() &&
++				    known_signature->second != probe.logical_segment)
++					return "ERR APITRACE_DUPLICATE_LOGICAL_SIGNATURE";
++				signatures[probe.signature] = probe.logical_segment;
++				probes.push_back(probe);
++				if (probes.size() > 32U)
++					return "ERR APITRACE_PROBE_COUNT_RANGE_1_32";
++			}
++			if (probes.empty()) return "ERR APITRACE_PROBE_COUNT_RANGE_1_32";
++			if (!remote_fileio_active) remote_observer_instruction_sequence = 0;
++			remote_api_trace_mode = REMOTE_API_TRACE_LOGICAL;
++			remote_api_trace_active = false;
++			remote_api_trace_events.clear();
++			remote_api_trace_logical_probes = probes;
++			remote_api_trace_bindings.clear();
++			remote_api_trace_capacity = static_cast<size_t>(capacity);
++			remote_api_trace_next_sequence = 0;
++			remote_api_trace_dropped = 0;
++			remote_api_trace_active = true;
++			return RemoteApiTraceStatus();
++		}
+ 		if (action == "STOP") {
+ 			std::string extra;
+ 			input >> extra;
+@@ -6868,6 +7117,8 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			remote_api_trace_events.clear();
+ 			remote_api_trace_next_sequence = 0;
+ 			remote_api_trace_dropped = 0;
++			if (remote_api_trace_mode == REMOTE_API_TRACE_LOGICAL)
++				remote_api_trace_bindings.clear();
+ 			return RemoteApiTraceStatus();
+ 		}
+ 		if (action == "DRAIN") {
+@@ -6884,7 +7135,7 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			}
+ 			return RemoteApiTraceDrain(count);
+ 		}
+-		return "ERR USAGE DEBUG APITRACE (START|STATUS|DRAIN|STOP|CLEAR)";
++		return "ERR USAGE DEBUG APITRACE (START|STARTLOGICAL|STATUS|DRAIN|STOP|CLEAR)";
+ 	}
+ 
+ 	if (command == "COVERAGE") {
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index 172404c..bf7d1d2 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -142,7 +142,7 @@ static std::string handle_command(const std::string& cmd) {
+                DOSBOX_X_BUILD_ID
+                " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
+ #if C_DEBUG
+-               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,SNAPSHOT,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,COVERAGE,CHECKPOINT,HASH,INPUT,DETERMINISM,WAIT,CONTINUE"
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,SNAPSHOT,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,APITRACE_LOGICAL_NE,COVERAGE,CHECKPOINT,HASH,INPUT,DETERMINISM,WAIT,CONTINUE"
+ #else
+                " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
+ #endif

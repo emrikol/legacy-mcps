@@ -404,33 +404,112 @@ const result2 = compareBmp('before.bmp', 'after.bmp', {
 
 ## DOSBox-X Control Server
 
-Control the DOSBox-X emulator itself (not the guest OS) via TCP. Requires DOSBox-X started with `DOSBOX_CONTROL_PORT=10199`:
+Control the emulator itself, independently of the guest mailbox. Start a
+patched DOSBox-X with `DOSBOX_CONTROL_PORT` set; leaving it unset disables the
+server.
 
 ```js
-// Ping the emulator
-const alive = await win.dosboxPing();
+const { DosboxControl } = require('./lib/dosbox-control');
+const control = new DosboxControl({ port: 10199, timeout: 5000 });
 
-// Read the DOS text screen (80x25 buffer)
-const screen = await win.dosboxScreen();
-console.log(screen); // lines of text
-
-// Type into DOS (before Windows boots, or in DOS prompt)
-await win.dosboxType('DIR C:\\');
-await win.dosboxKey('ENTER');
-
-// Take a DOSBox-X screenshot (PNG, saved to capture dir)
-await win.dosboxScreenshot();
-
-// Get emulator status
-const status = await win.dosboxStatus();
+console.log(await control.identity());
+console.log(await control.status());
+console.log(await control.ping());
 ```
 
-This is useful for:
+`DosboxControl` opens one TCP connection per command and returns the complete
+text response. Its API is:
+
+| Method | Description |
+|---|---|
+| `send(command, options?)` | Send one printable-ASCII control command |
+| `ping()` / `status()` / `identity()` | Query liveness, emulator state, or the source-derived build/capability identity |
+| `minimize()` | Ask the emulator main thread to minimize its host window |
+| `debug(command, options?)` | Run one command on the emulator debugger thread |
+| `debugBatch(commands, options?)` | Run 1–8 allowed non-resuming commands as one stopped-CPU scheduling unit |
+
+The same transport is exposed on a `WinAuto` instance as `dosboxCommand`,
+`dosboxPing`, `dosboxScreen`, `dosboxScreenshot`, `dosboxType`, `dosboxKey`,
+`dosboxStatus`, `dosboxIdentity`, `dosboxMinimize`, `dosboxDebug`, and
+`dosboxDebugBatch`:
+
+```js
+const alive = await win.dosboxPing();
+const identity = await win.dosboxIdentity();
+const screen = await win.dosboxScreen();
+
+await win.dosboxType('DIR C:\\');
+await win.dosboxKey('ENTER');
+await win.dosboxScreenshot();
+```
+
+### Remote debugger
+
+Pause before collecting related state and always arrange to continue in a
+`finally` block when the guest should resume:
+
+```js
+await control.debug('PAUSE');
+try {
+  const snapshot = await control.debugBatch([
+    'REGISTERS',
+    'STACK 8',
+    'DISASM',
+  ]);
+  console.log(snapshot);
+} finally {
+  await control.debug('CONTINUE');
+}
+```
+
+Batch framing uses decimal byte lengths rather than separators, so command
+responses cannot make the request ambiguous. A batch accepts 1–8 commands of
+at most 512 printable ASCII bytes each. Resuming or nested commands such as
+`BATCH`, `PAUSE`, `STATUS`, `RUN`, `NEXT`, `WAIT`, and `CONTINUE` are rejected.
+A batch is atomic only as a scheduling unit: earlier breakpoint, tracing, or
+CPU-state changes are not rolled back when a later command fails.
+
+Debugger command groups advertised by `IDENTITY` include:
+
+- State: `STATUS`, `PAUSE`, `REGISTERS`, `SELECTOR`, `MEMORY`, `DISASM`,
+  `STACK`, `SNAPSHOT`, `HASH`.
+- Execution: `STEP`, `NEXT`, `FINISH`, `RUN`, `WAIT`, `CONTINUE`.
+- Stops: `BREAK`, `WATCH`, `INTERRUPT`, and `EXCEPTION`, including bounded
+  filters and one-shot stops.
+- Observation: `FILEIO`, `APITRACE`, and `COVERAGE`, each with bounded buffers,
+  status, drain, stop, and clear operations.
+- Replay support: `CHECKPOINT`, instruction-sequenced `INPUT`, and
+  `DETERMINISM` recording/verification.
+- Mutation: `MUTATE REGISTER` and `MUTATE MEMORY`, which require the literal
+  confirmation token reported by the command's usage error.
+
+The exact grammar is returned fail-closed in `ERR USAGE` responses and evolves
+with the capability identity. Check `IDENTITY` before depending on a command.
+See [examples/dosbox-debugger.js](examples/dosbox-debugger.js) for a complete
+read-only snapshot.
+
+### Evidence and safety limits
+
+The endpoint binds to `127.0.0.1`, but it is deliberately unauthenticated. Any
+local process able to reach the port can inspect guest memory, control guest
+execution and input, capture screens, shut down the emulator, or invoke unsafe
+mutation. Never forward or proxy the socket. Use an isolated host/session when
+other local processes are not trusted.
+
+Inspection is read-only; mutation is not. After successful `MUTATE`, regard the
+entire emulator session as manipulated evidence even if later bytes happen to
+match their earlier values. `SNAPSHOT` requires a stopped CPU and captures a
+bounded rendered image, but is not an atomic snapshot of every device. Replay
+verification checks recorded clocks, DOS reads/offsets, IRQs, NMIs, checkpoint,
+and sequenced input; it does not establish universal emulator determinism.
+
+Typical uses include:
 
 - Automating the DOS boot sequence before Windows starts
 - Reading text-mode screens (e.g., BIOS, DOS prompts)
 - Typing DOS commands that happen before WIN-MCP loads
-- Taking screenshots when Windows isn't running
+- Inspecting protected-mode selectors, memory, call stacks, and stop causes
+- Capturing bounded file, API, coverage, and replay evidence
 
 ## Architecture
 

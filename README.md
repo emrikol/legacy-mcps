@@ -8,9 +8,9 @@ Remote control agents for DOS and Windows 3.x, driven from a modern host via fil
 
 Two small programs that run inside vintage operating systems and expose their APIs to the outside world:
 
-- **[dos-mcp](dos-mcp/)** — A DOS TSR (Terminate and Stay Resident) program written in 8086 assembly. Hooks the timer interrupt, polls for commands, executes them via DOS/BIOS interrupts, and writes responses back. 153 passing tests.
+- **[dos-mcp](dos-mcp/)** — A DOS TSR (Terminate and Stay Resident) program written in 8086 assembly. Hooks the timer interrupt, polls for commands, executes them via DOS/BIOS interrupts, and writes responses back.
 
-- **[win-mcp](win-mcp/)** — A Win16 application written in C (Open Watcom). Runs as a hidden window inside Windows 3.x, polls for commands via a timer, executes them via the Windows API, and writes responses back. 75 passing tests.
+- **[win-mcp](win-mcp/)** — A Win16 application written in C (Open Watcom). Runs as a hidden window inside Windows 3.x, polls for commands via a timer, executes them via the Windows API, and writes responses back.
 
 Both use the same protocol: the host writes a command to a text file, the agent reads it, executes it, and writes a response to another text file. No network stack, no sockets, no shared memory — just files. This works because the "files" live on a shared drive (SMB mount, DOSBox-X host directory mount, or emu2 drive mapping).
 
@@ -39,19 +39,31 @@ The two agents run independently and simultaneously. The DOS TSR handles real-mo
 
 ## Quick start
 
-### Build and test (Win16 — requires display)
+### Build and test (Win16 — headless guest run)
 
 ```bash
 cd win-mcp
-make testwin    # Builds WINMCP.EXE, boots Windows 3.1 in DOSBox-X, runs 75 tests
+make testwin    # Builds WINMCP.EXE, boots Windows 3.1, runs the harness
 ```
 
 ### Build and test (DOS — headless)
 
 ```bash
 cd dos-mcp
-make test       # Assembles DOSMCP.COM, runs in emu2, runs 153 tests
+make test       # Assembles DOSMCP.COM and runs the headless harness in emu2
 ```
+
+Both guest agents embed a SHA-256 identity over their declared source/build
+contract. Their Makefiles refresh it automatically. Verify the checked headers
+without building with:
+
+```bash
+node scripts/update-guest-tool-identities.js --check
+node scripts/test-guest-tool-identities.js
+```
+
+The receipt identifies reviewed source and build recipes; it is not a claim of
+bit-for-bit reproducibility across compilers or hosts.
 
 ### Requirements
 
@@ -61,9 +73,12 @@ make test       # Assembles DOSMCP.COM, runs in emu2, runs 153 tests
 | [Node.js](https://nodejs.org/) | 18+ | Runs test harnesses and scripting library |
 | `tools/watcom/` | Open Watcom 2.0 | Cross-compiles Win16 C code from macOS/Linux |
 | `tools/emu2` | patched | Headless DOS emulator for `make test` |
-| `tools/dosbox-x` | patched | DOSBox-X for `make testwin` (requires display) |
+| `tools/dosbox-x` | patched | DOSBox-X for the SDL-dummy `make testwin` guest run |
 
-`tools/emu2` and `tools/dosbox-x` are patched builds — see [PATCHES.md](PATCHES.md) for how to build them from source.
+`tools/emu2` and `tools/dosbox-x` are patched builds. The DOSBox-X patch
+series also provides a loopback control server and protected-mode debugger.
+See [PATCHES.md](PATCHES.md) for the exact public bases, patch application,
+build identity, and security boundary.
 
 > **Windows 3.1 required — not included.** Running the Win16 tests requires a licensed copy of Windows 3.1 or Windows for Workgroups 3.11. The installer files cannot be redistributed here. You must supply your own copy and place it in `tools/win31-hdd/` following the setup instructions in [win-mcp/README.md](win-mcp/README.md).
 
@@ -81,7 +96,7 @@ Both agents use the same protocol:
 
 ```
 OK PONG
-OK WINMCP/0.3 META,PROFILE,FILE,DIR,...
+OK WINMCP/0.9 META,PROFILE,FILE,DIR,...
 OK W=640 H=480 BPP=8
 ERR NOT_FOUND
 ERR INVALID_HWND
@@ -91,9 +106,22 @@ ERR INVALID_HWND
 
 **Atomic writes:** The host writes to a temp file first, then renames it to the TX path. This prevents the agent from reading a partially-written command.
 
+### Security model
+
+These are debugging agents, not security boundaries. Any process with write
+access to the shared `_MAGIC_` directory can issue commands and read responses.
+WINMCP intentionally exposes all control text, protected-mode memory, heap and
+module metadata; it does not redact password-style controls. Its unsafe memory
+write command is explicit and audited, but mailbox access itself is not
+authenticated. Restrict share permissions and use a disposable guest when the
+host or guest workload is not trusted.
+
+The optional DOSBox-X TCP control endpoint is a separate privileged interface.
+It binds to loopback but has no authentication; see [PATCHES.md](PATCHES.md#control-protocol-and-security-boundary).
+
 ## Command overview
 
-### DOS MCP — 22 command families, 80+ commands, 153 tests
+### DOS MCP — 22 command families and 80+ commands
 
 | Family | Commands | What it does |
 |---|---|---|
@@ -120,7 +148,7 @@ ERR INVALID_HWND
 | POWER | STATUS, IDLE, STANDBY, OFF | APM power management |
 | TSR | LIST | List resident programs with sizes |
 
-### Win16 MCP — 32 command families, 91 tests
+### Win16 MCP — 35 command families
 
 | Family | Commands | What it does |
 |---|---|---|
@@ -132,11 +160,11 @@ ERR INVALID_HWND
 | ENV | GET | Environment variables |
 | EXEC | (program) | Launch programs via WinExec |
 | WINDOW | LIST, FIND, TITLE, CLOSE, MOVE, SHOW, RECT, VISIBLE, ENABLED | Window enumeration and control |
-| TASK | LIST, KILL | Task management (ToolHelp API) |
+| TASK | LIST, INFO, CSIP, STACK, KILL | Task management and inspection (ToolHelp API) |
 | GDI | SCREEN, CAPTURE | Screen info + 24-bit BMP screenshots |
 | MSG | SEND, POST | SendMessage / PostMessage with arbitrary params |
 | CLIP | GET, SET | Clipboard text read/write |
-| DIALOG | LIST, GET, SET, CLICK | Dialog control enumeration and manipulation |
+| DIALOG | LIST, GET, SET, TYPE, CLICK | Dialog control enumeration and manipulation |
 | DDE | CONNECT, EXEC, CLOSE | Dynamic Data Exchange |
 | TYPE | (text) | Text input via WM_CHAR with escape sequences |
 | SENDKEYS | (keys) | Keyboard simulation with VK codes and modifiers |
@@ -145,7 +173,10 @@ ERR INVALID_HWND
 | MENU | (hwnd, id) | Menu command via WM_COMMAND |
 | FOCUS | (hwnd) | SetFocus + BringWindowToTop |
 | SCROLL | (hwnd, dir, n) | Scroll via WM_VSCROLL/WM_HSCROLL |
-| CONTROL | FIND | Child window locator (Playwright-style) |
+| CONTROL | FIND, FINDID | Child window locator by class/text or direct dialog ID |
+| MODULE | LIST, INFO, SEGMENTS, PROC | Loaded-module, segment, and exported-procedure inspection |
+| MEMORY | READ, WRITE UNSAFE | Protected-mode memory inspection and explicitly unsafe mutation |
+| HEAP | SUMMARY, GLOBAL, HANDLE, LOCAL | ToolHelp heap, resource, and handle inspection |
 | LIST | SELECT | Listbox selection |
 | COMBO | SELECT | Combobox selection |
 | CHECK | (hwnd, id) | Set checkbox checked |
@@ -176,11 +207,18 @@ await notepad.close();
 
 See [SCRIPTING.md](SCRIPTING.md) for the full API reference.
 
+The patched DOSBox-X control endpoint is also available through
+`lib/dosbox-control.js` or the `WinAuto` `dosbox*` methods. It exposes emulator
+identity, status, minimize, and debugger commands independently of WINMCP's
+file mailbox. The server listens on loopback but has no authentication; any
+local process that can connect has privileged debugging control.
+
 **Examples:**
 
 - [examples/notepad.js](examples/notepad.js) — open Notepad, type text, read clipboard, capture screenshot
 - [examples/minesweeper.js](examples/minesweeper.js) — launch Minesweeper, click corners, take screenshots
 - [examples/dos-sysinfo.js](examples/dos-sysinfo.js) — query DOS MCP directly (version, memory, TSR list)
+- [examples/dosbox-debugger.js](examples/dosbox-debugger.js) — pause DOSBox-X and collect an atomic debugger snapshot
 
 ## Project structure
 
@@ -192,15 +230,17 @@ legacy-mcps/
 ├── WIN-MCP.md             Original architecture design document
 ├── lib/
 │   ├── win-auto.js        Node.js scripting library (Playwright-style)
+│   ├── dosbox-control.js  DOSBox-X control/debugger TCP client
 │   └── win-compare.js     BMP screenshot comparison utility
 ├── examples/
 │   ├── notepad.js         Demo: type text, read clipboard, screenshot
 │   ├── minesweeper.js     Demo: automate Minesweeper (Win16)
-│   └── dos-sysinfo.js     Demo: query DOS MCP for system info
+│   ├── dos-sysinfo.js     Demo: query DOS MCP for system info
+│   └── dosbox-debugger.js Demo: stopped-CPU debugger batch
 ├── dos-mcp/               DOS TSR agent
 │   ├── src/dosmcp.asm     Source (8086 NASM assembly)
 │   ├── Makefile            Build + test targets
-│   ├── test-harness.js     Node.js test runner (153 tests)
+│   ├── test-harness.js     Node.js test runner (154 tests)
 │   ├── dosbox-run.sh       DOSBox-X launcher
 │   └── dosbox-test.conf    DOSBox-X config (TSR mode)
 ├── win-mcp/               Win16 agent
@@ -208,7 +248,7 @@ legacy-mcps/
 │   ├── src/winmcp.def     Module definition
 │   ├── src/Makefile        Watcom cross-compile
 │   ├── Makefile            Build + test targets
-│   ├── test-harness.js     Node.js test runner (91 tests, uses win-auto.js)
+│   ├── test-harness.js     Node.js integration harness (uses win-auto.js)
 │   ├── dosbox-run.sh       DOSBox-X launcher
 │   ├── dosbox-win31.conf   Windows 3.1 boot config
 │   └── capture/            Screenshots from GDI CAPTURE
@@ -223,7 +263,8 @@ legacy-mcps/
 │   └── Keyboard scancodes, BIOS data area, etc.
 ├── patches/               Patch files for vendored tools
 │   ├── emu2-mcp.diff       emu2 patches (apply to dmsc/emu2@4948d1e)
-│   └── dosbox-x-mcp.diff   DOSBox-X patches (apply to joncampbell123/dosbox-x@59915c1)
+│   └── dosbox-x/           Ordered DOSBox-X patch series and source contract
+├── scripts/               Patch, identity, and client verification tools
 └── tools/                 Build tools (not in repo — see PATCHES.md)
     ├── dosbox-x            Patched DOSBox-X binary (build from source)
     ├── emu2                Patched emu2 binary (build from source)

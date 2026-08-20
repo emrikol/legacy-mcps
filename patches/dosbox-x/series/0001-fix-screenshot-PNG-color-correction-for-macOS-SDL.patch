@@ -1,0 +1,92 @@
+From ac81771ab6001aa2c28b55ea2a3fd72c79aa8e04 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 28 Mar 2026 00:04:40 -0400
+Subject: [PATCH 01/19] fix: screenshot PNG color correction for macOS/SDL
+
+Probe GFX_GetRGB to detect R/G/B byte offsets in 32-bit pixels,
+fixing yellow/green color tint in screenshots on macOS.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/hardware/hardware.cpp | 42 ++++++++++++++++++++++++++++++++-------
+ 1 file changed, 35 insertions(+), 7 deletions(-)
+
+diff --git a/src/hardware/hardware.cpp b/src/hardware/hardware.cpp
+index 5c2037d..2d6c831 100644
+--- a/src/hardware/hardware.cpp
++++ b/src/hardware/hardware.cpp
+@@ -806,6 +806,9 @@ static inline unsigned long math_gcd_png_uint_32(const png_uint_32 a,const png_u
+ }
+ #endif
+ 
++/* Byte offsets for R, G, B in 32-bit pixels (detected at capture time) */
++static int capture_rOff = 2, capture_gOff = 1, capture_bOff = 0;
++
+ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags, float fps, uint8_t * data, uint8_t * pal) {
+ #if (C_SSHOT)
+ 	Bitu i;
+@@ -868,7 +871,24 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
+ 			}
+ 			png_set_PLTE(png_ptr, info_ptr, palette,256);
+ 		} else {
+-			png_set_bgr( png_ptr );
++			/* Detect byte order: GFX_GetRGB returns pixels in host surface format.
++			 * Find which byte offset contains R, G, B by probing with known values. */
++			uint32_t probe_r = (uint32_t)GFX_GetRGB(0xFF, 0x00, 0x00);
++			uint32_t probe_g = (uint32_t)GFX_GetRGB(0x00, 0xFF, 0x00);
++			uint8_t *pr = (uint8_t*)&probe_r;
++			uint8_t *pg = (uint8_t*)&probe_g;
++			int rOff = 0, gOff = 1, bOff = 2;
++			for (int k = 0; k < 4; k++) { if (pr[k] == 0xFF) rOff = k; }
++			for (int k = 0; k < 4; k++) { if (pg[k] == 0xFF) gOff = k; }
++			/* B is whichever of 0,1,2,3 isn't R, G, or alpha */
++			for (int k = 0; k < 4; k++) {
++				if (k != rOff && k != gOff) {
++					uint32_t probe_b = (uint32_t)GFX_GetRGB(0x00, 0x00, 0xFF);
++					if (((uint8_t*)&probe_b)[k] == 0xFF) { bOff = k; break; }
++				}
++			}
++			capture_rOff = rOff; capture_gOff = gOff; capture_bOff = bOff;
++			/* No png_set_bgr — we write RGB directly using detected offsets */
+ 			png_set_IHDR(png_ptr, info_ptr, (png_uint_32)width, (png_uint_32)height,
+ 				8, PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE,
+ 				PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
+@@ -944,17 +964,18 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
+ 				rowPointer = doubleRow;
+ 				break;
+ 			case 32:
++				/* Extract R,G,B from 32-bit pixels using detected byte offsets */
+ 				if (flags & CAPTURE_FLAG_DBLW) {
+ 					for (Bitu x=0;x<countWidth;x++) {
+-						doubleRow[x*6+0] = doubleRow[x*6+3] = ((uint8_t *)srcLine)[x*4+0];
+-						doubleRow[x*6+1] = doubleRow[x*6+4] = ((uint8_t *)srcLine)[x*4+1];
+-						doubleRow[x*6+2] = doubleRow[x*6+5] = ((uint8_t *)srcLine)[x*4+2];
++						doubleRow[x*6+0] = doubleRow[x*6+3] = ((uint8_t *)srcLine)[x*4+capture_rOff];
++						doubleRow[x*6+1] = doubleRow[x*6+4] = ((uint8_t *)srcLine)[x*4+capture_gOff];
++						doubleRow[x*6+2] = doubleRow[x*6+5] = ((uint8_t *)srcLine)[x*4+capture_bOff];
+ 					}
+ 				} else {
+ 					for (Bitu x=0;x<countWidth;x++) {
+-						doubleRow[x*3+0] = ((uint8_t *)srcLine)[x*4+0];
+-						doubleRow[x*3+1] = ((uint8_t *)srcLine)[x*4+1];
+-						doubleRow[x*3+2] = ((uint8_t *)srcLine)[x*4+2];
++						doubleRow[x*3+0] = ((uint8_t *)srcLine)[x*4+capture_rOff];
++						doubleRow[x*3+1] = ((uint8_t *)srcLine)[x*4+capture_gOff];
++						doubleRow[x*3+2] = ((uint8_t *)srcLine)[x*4+capture_bOff];
+ 					}
+ 				}
+ 				rowPointer = doubleRow;
+@@ -970,6 +991,13 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
+ 		fclose(fp);
+ 		if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
+ 
++		/* Notify control server if it requested this screenshot */
++		{
++			extern bool ControlServer_ScreenshotRequested();
++			extern void ControlServer_ScreenshotComplete();
++			if (ControlServer_ScreenshotRequested())
++				ControlServer_ScreenshotComplete();
++		}
+ 	}
+ 	pathscr = "";
+ skip_shot:

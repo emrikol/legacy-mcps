@@ -1,0 +1,457 @@
+From 21a83e4168acc89a33efb090a8bcb21a2f07fec8 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 20:52:10 -0400
+Subject: [PATCH 13/19] feat(debugger): replay input at instruction boundaries
+
+---
+ include/tool_build_identity.h     |   2 +-
+ src/debug/debug.cpp               | 269 +++++++++++++++++++++++++++++-
+ src/gui/dosbox_control_server.cpp |   2 +-
+ src/gui/sdlmain.cpp               |  49 ++++++
+ 4 files changed, 319 insertions(+), 3 deletions(-)
+
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+index aaaa7b0..aae2074 100644
+--- a/include/tool_build_identity.h
++++ b/include/tool_build_identity.h
+@@ -1,2 +1,2 @@
+ /* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
+-#define DOSBOX_X_BUILD_ID "a5a3f83d4816e312f59c148d694fdca08bc15f5c40c2089357808265c6a1f877"
++#define DOSBOX_X_BUILD_ID "f0dcadd49070f931f2a09c25d3e192cc71d810888480c07f4a5845a3ed90e076"
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index c37a416..c642891 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -62,6 +62,7 @@ using namespace std;
+ bool Clear_SYSENTER_Debug();
+ bool Toggle_BreakSYSEnter();
+ bool Toggle_BreakSYSExit();
++uint32_t Keyb_ig_status();
+ 
+ /* [https://github.com/joncampbell123/dosbox-x/issues/1264] ncurses non-ASCII keys are outside ASCII range (start at octal 0400 == hex 0x100) */
+ static inline int ncurses_aware_toupper(int x) {
+@@ -381,6 +382,22 @@ static bool remote_replay_active = false;
+ static uint64_t remote_replay_sequence = 0;
+ static bool remote_replay_save_component_written = false;
+ static bool remote_replay_load_component_seen = false;
++enum RemoteReplayInputKind {
++	REMOTE_INPUT_KEY,
++	REMOTE_INPUT_MOUSE_MOVE,
++	REMOTE_INPUT_MOUSE_BUTTON
++};
++struct RemoteReplayInput {
++	uint64_t sequence;
++	RemoteReplayInputKind kind;
++	uint16_t value;
++	uint16_t x;
++	uint16_t y;
++	bool pressed;
++};
++static std::vector<RemoteReplayInput> remote_replay_input_log;
++static std::deque<RemoteReplayInput> remote_replay_pending_inputs;
++static size_t remote_replay_skipped_inputs = 0;
+ enum RemoteCheckpointAction {
+ 	REMOTE_CHECKPOINT_NONE,
+ 	REMOTE_CHECKPOINT_SAVE,
+@@ -399,9 +416,14 @@ public:
+ 	void getBytes(std::ostream &stream) override
+ 	{
+ 		const uint32_t magic = UINT32_C(0x52525031); /* "RRP1" */
++		uint16_t mouse_x = 0, mouse_y = 0;
++		void GFX_GetReplayMousePosition(uint16_t &x, uint16_t &y);
++		GFX_GetReplayMousePosition(mouse_x, mouse_y);
+ 		writePOD(stream, magic);
+ 		writePOD(stream, remote_replay_active);
+ 		writePOD(stream, remote_replay_sequence);
++		writePOD(stream, mouse_x);
++		writePOD(stream, mouse_y);
+ 		remote_replay_save_component_written = stream.good();
+ 	}
+ 
+@@ -410,12 +432,17 @@ public:
+ 		uint32_t magic = 0;
+ 		bool active = false;
+ 		uint64_t sequence = 0;
++		uint16_t mouse_x = 0, mouse_y = 0;
+ 		readPOD(stream, magic);
+ 		readPOD(stream, active);
+ 		readPOD(stream, sequence);
++		readPOD(stream, mouse_x);
++		readPOD(stream, mouse_y);
+ 		if (!stream.good() || magic != UINT32_C(0x52525031)) return;
+ 		remote_replay_active = active;
+ 		remote_replay_sequence = sequence;
++		void GFX_SetReplayMousePosition(uint16_t x, uint16_t y);
++		GFX_SetReplayMousePosition(mouse_x, mouse_y);
+ 		remote_replay_load_component_seen = true;
+ 	}
+ };
+@@ -426,9 +453,36 @@ static RemoteReplaySaveState &RemoteReplayStateComponent()
+ 	return component;
+ }
+ 
++static void RemoteReplayDeliverInputs()
++{
++	/* Never inject late. A missed boundary is a replay-integrity failure, so
++	 * discard it visibly instead of blocking every later queued event forever. */
++	while (!remote_replay_pending_inputs.empty() &&
++	       remote_replay_pending_inputs.front().sequence < remote_replay_sequence) {
++		remote_replay_pending_inputs.pop_front();
++		++remote_replay_skipped_inputs;
++	}
++	while (!remote_replay_pending_inputs.empty() &&
++	       remote_replay_pending_inputs.front().sequence == remote_replay_sequence) {
++		const RemoteReplayInput input = remote_replay_pending_inputs.front();
++		remote_replay_pending_inputs.pop_front();
++		if (input.kind == REMOTE_INPUT_KEY) {
++			KEYBOARD_AddKey(static_cast<KBD_KEYS>(input.value), input.pressed);
++		} else if (input.kind == REMOTE_INPUT_MOUSE_MOVE) {
++			void GFX_ReplayMouseMove(uint16_t x, uint16_t y);
++			GFX_ReplayMouseMove(input.x, input.y);
++		} else {
++			void GFX_ReplayMouseButton(bool pressed);
++			GFX_ReplayMouseButton(input.pressed);
++		}
++	}
++}
++
+ void DEBUG_RemoteInstructionRetired(void)
+ {
+-	if (remote_replay_active) ++remote_replay_sequence;
++	if (!remote_replay_active) return;
++	++remote_replay_sequence;
++	RemoteReplayDeliverInputs();
+ }
+ 
+ struct RemoteFileIoEvent {
+@@ -5600,16 +5654,23 @@ static bool RemoteCheckpointArchiveMatches(const std::string &path,
+ 		uint32_t magic = 0;
+ 		bool active = false;
+ 		uint64_t sequence = 0;
++		uint16_t mouse_x = 0, mouse_y = 0;
+ 		const int magic_bytes = unzReadCurrentFile(archive, &magic, sizeof(magic));
+ 		const int active_bytes = unzReadCurrentFile(archive, &active, sizeof(active));
+ 		const int sequence_bytes =
+ 		        unzReadCurrentFile(archive, &sequence, sizeof(sequence));
++		const int mouse_x_bytes =
++		        unzReadCurrentFile(archive, &mouse_x, sizeof(mouse_x));
++		const int mouse_y_bytes =
++		        unzReadCurrentFile(archive, &mouse_y, sizeof(mouse_y));
+ 		uint8_t extra = 0;
+ 		const int extra_bytes = unzReadCurrentFile(archive, &extra, sizeof(extra));
+ 		const int member_close = unzCloseCurrentFile(archive);
+ 		matches = magic_bytes == static_cast<int>(sizeof(magic)) &&
+ 		          active_bytes == static_cast<int>(sizeof(active)) &&
+ 		          sequence_bytes == static_cast<int>(sizeof(sequence)) &&
++		          mouse_x_bytes == static_cast<int>(sizeof(mouse_x)) &&
++		          mouse_y_bytes == static_cast<int>(sizeof(mouse_y)) &&
+ 		          extra_bytes == 0 && member_close == UNZ_OK &&
+ 		          magic == UINT32_C(0x52525031) && active &&
+ 		          sequence == expected_sequence;
+@@ -5669,6 +5730,9 @@ static std::string RemotePerformCheckpointAction()
+ 			result = "ERR CHECKPOINT_RESTORE_FAILED STATE_UNCERTAIN_STOPPED=1";
+ 		} else {
+ 			remote_replay_active = true;
++			/* The input plan is debugger-side evidence, not guest state. Discard any
++			 * old pending copy; INPUT REPLAY rebuilds it from the retained log. */
++			remote_replay_pending_inputs.clear();
+ 			result = "OK CHECKPOINT=RESTORED NAME=" + name +
+ 			         " SEQUENCE=" + std::to_string(remote_replay_sequence);
+ 		}
+@@ -5715,6 +5779,10 @@ static std::string RemoteGuestStateHash(uint16_t selector, uint32_t offset,
+ 	RemoteHashValue(hash, SegValue(cs), 2); RemoteHashValue(hash, SegValue(ss), 2);
+ 	RemoteHashValue(hash, SegValue(ds), 2); RemoteHashValue(hash, SegValue(es), 2);
+ 	RemoteHashValue(hash, SegValue(fs), 2); RemoteHashValue(hash, SegValue(gs), 2);
++	/* The replay injector mutates the emulated keyboard/mouse controller, not
++	 * CPU registers. Include its compact deterministic state so HASH can prove
++	 * that an input-bearing branch differs from a no-input negative control. */
++	RemoteHashValue(hash, Keyb_ig_status(), 4);
+ 	for (uint32_t index = 0; index < count; ++index) {
+ 		uint8_t value = 0;
+ 		if (mem_readb_checked(static_cast<PhysPt>(first + index), &value))
+@@ -5731,6 +5799,122 @@ static std::string RemoteGuestStateHash(uint16_t selector, uint32_t offset,
+ 	return out.str();
+ }
+ 
++static bool RemoteParseDecimalSequence(const std::string &text, uint64_t &value)
++{
++	if (text.empty() || text.size() > 20U) return false;
++	value = 0;
++	for (const auto ch : text) {
++		if (!isdigit(static_cast<unsigned char>(ch))) return false;
++		const uint64_t digit = static_cast<uint64_t>(ch - '0');
++		if (value > (UINT64_MAX - digit) / 10U) return false;
++		value = value * 10U + digit;
++	}
++	return true;
++}
++
++static KBD_KEYS RemoteReplayKey(const std::string &raw_name)
++{
++	std::string name = raw_name;
++	for (auto &ch : name) ch = static_cast<char>(toupper(ch));
++	static const struct { const char *name; KBD_KEYS key; } names[] = {
++		{"ENTER", KBD_enter}, {"ESC", KBD_esc}, {"TAB", KBD_tab},
++		{"SPACE", KBD_space}, {"BACKSPACE", KBD_backspace},
++		{"DELETE", KBD_delete}, {"INSERT", KBD_insert}, {"HOME", KBD_home},
++		{"END", KBD_end}, {"PGUP", KBD_pageup}, {"PGDN", KBD_pagedown},
++		{"LEFT", KBD_left}, {"RIGHT", KBD_right}, {"UP", KBD_up},
++		{"DOWN", KBD_down}, {"LALT", KBD_leftalt}, {"RALT", KBD_rightalt},
++		{"LCTRL", KBD_leftctrl}, {"RCTRL", KBD_rightctrl},
++		{"LSHIFT", KBD_leftshift}, {"RSHIFT", KBD_rightshift},
++		{"F1", KBD_f1}, {"F2", KBD_f2}, {"F3", KBD_f3}, {"F4", KBD_f4},
++		{"F5", KBD_f5}, {"F6", KBD_f6}, {"F7", KBD_f7}, {"F8", KBD_f8},
++		{"F9", KBD_f9}, {"F10", KBD_f10}, {"F11", KBD_f11}, {"F12", KBD_f12}
++	};
++	for (const auto &entry : names)
++		if (name == entry.name) return entry.key;
++	if (name.size() == 1U) {
++		const char ch = name[0];
++		if (ch >= '1' && ch <= '9') return static_cast<KBD_KEYS>(KBD_1 + ch - '1');
++		if (ch == '0') return KBD_0;
++		static const KBD_KEYS letters[] = {
++			KBD_a, KBD_b, KBD_c, KBD_d, KBD_e, KBD_f, KBD_g, KBD_h, KBD_i,
++			KBD_j, KBD_k, KBD_l, KBD_m, KBD_n, KBD_o, KBD_p, KBD_q, KBD_r,
++			KBD_s, KBD_t, KBD_u, KBD_v, KBD_w, KBD_x, KBD_y, KBD_z
++		};
++		if (ch >= 'A' && ch <= 'Z') return letters[ch - 'A'];
++	}
++	return KBD_NONE;
++}
++
++static std::string RemoteReplayInputRecord(const RemoteReplayInput &input)
++{
++	std::ostringstream out;
++	out << "SEQ=" << input.sequence;
++	if (input.kind == REMOTE_INPUT_KEY) {
++		out << " TYPE=KEY VALUE=" << input.value
++		    << " STATE=" << (input.pressed ? "DOWN" : "UP");
++	} else if (input.kind == REMOTE_INPUT_MOUSE_MOVE) {
++		out << " TYPE=MOUSE_MOVE X=" << input.x << " Y=" << input.y;
++	} else {
++		out << " TYPE=MOUSE_LEFT STATE=" << (input.pressed ? "DOWN" : "UP");
++	}
++	return out.str();
++}
++
++static std::string RemoteReplayInputAdd(const RemoteReplayInput &input)
++{
++	static const size_t maximum_inputs = 256U;
++	static const uint64_t maximum_lead = UINT64_C(10000000);
++	if (!remote_replay_active) return "ERR CHECKPOINT_REQUIRED";
++	if (input.sequence <= remote_replay_sequence ||
++	    input.sequence - remote_replay_sequence > maximum_lead)
++		return "ERR INPUT_SEQUENCE_RANGE_NEXT_10000000";
++	if (remote_replay_input_log.size() >= maximum_inputs)
++		return "ERR INPUT_LOG_FULL_256";
++	if (!remote_replay_input_log.empty() &&
++	    input.sequence < remote_replay_input_log.back().sequence)
++		return "ERR INPUT_SEQUENCE_NOT_MONOTONIC";
++	remote_replay_input_log.push_back(input);
++	remote_replay_pending_inputs.push_back(input);
++	return "OK ADDED " + RemoteReplayInputRecord(input);
++}
++
++static std::string RemoteReplayInputStatus()
++{
++	std::ostringstream out;
++	out << "OK ACTIVE=" << (remote_replay_active ? 1 : 0)
++	    << " SEQUENCE=" << remote_replay_sequence
++	    << " LOGGED=" << remote_replay_input_log.size()
++	    << " PENDING=" << remote_replay_pending_inputs.size()
++	    << " SKIPPED=" << remote_replay_skipped_inputs
++	    << " BOUNDARY=AFTER_RETIRE_BEFORE_NEXT";
++	return out.str();
++}
++
++static std::string RemoteReplayInputLog()
++{
++	std::ostringstream out;
++	out << "OK COUNT=" << remote_replay_input_log.size();
++	for (const auto &input : remote_replay_input_log)
++		out << "\n" << RemoteReplayInputRecord(input)
++		    << " BOUNDARY_PASSED="
++		    << (input.sequence <= remote_replay_sequence ? 1 : 0);
++	return out.str();
++}
++
++static std::string RemoteReplayInputs()
++{
++	if (!remote_replay_active) return "ERR CHECKPOINT_REQUIRED";
++	if (!remote_replay_pending_inputs.empty()) return "ERR INPUT_PENDING_NOT_EMPTY";
++	if (remote_replay_skipped_inputs != 0U) return "ERR INPUT_LOG_HAS_SKIPPED";
++	for (const auto &input : remote_replay_input_log)
++		if (input.sequence > remote_replay_sequence)
++			remote_replay_pending_inputs.push_back(input);
++	std::ostringstream out;
++	out << "OK REPLAYED=" << remote_replay_pending_inputs.size()
++	    << " FROM_SEQUENCE=" << remote_replay_sequence;
++	return out.str();
++}
++
+ static std::string RemoteExecuteCommand(const std::string &request,
+                                         bool &resume);
+ 
+@@ -5876,6 +6060,89 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		return RemoteGuestStateHash(selector, offset, count);
+ 	}
+ 
++	if (command == "INPUT") {
++		std::string action, extra;
++		input >> action;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "STATUS") {
++			input >> extra;
++			return extra.empty() ? RemoteReplayInputStatus() :
++			       "ERR USAGE DEBUG INPUT STATUS";
++		}
++		if (action == "LOG") {
++			input >> extra;
++			return extra.empty() ? RemoteReplayInputLog() :
++			       "ERR USAGE DEBUG INPUT LOG";
++		}
++		if (action == "CLEAR") {
++			input >> extra;
++			if (!extra.empty()) return "ERR USAGE DEBUG INPUT CLEAR";
++			remote_replay_input_log.clear();
++			remote_replay_pending_inputs.clear();
++			remote_replay_skipped_inputs = 0;
++			return "OK CLEARED";
++		}
++		if (action == "REPLAY") {
++			input >> extra;
++			return extra.empty() ? RemoteReplayInputs() :
++			       "ERR USAGE DEBUG INPUT REPLAY";
++		}
++		if (action == "ADD") {
++			std::string sequence_text, kind;
++			input >> sequence_text >> kind;
++			for (auto &ch : kind) ch = static_cast<char>(toupper(ch));
++			uint64_t sequence = 0;
++			if (!RemoteParseDecimalSequence(sequence_text, sequence))
++				return "ERR INVALID_INPUT_SEQUENCE";
++			RemoteReplayInput replay_input = {};
++			replay_input.sequence = sequence;
++			if (kind == "KEY") {
++				std::string key_name, state;
++				input >> key_name >> state >> extra;
++				for (auto &ch : state) ch = static_cast<char>(toupper(ch));
++				const KBD_KEYS key = RemoteReplayKey(key_name);
++				if (key == KBD_NONE) return "ERR INVALID_INPUT_KEY";
++				if ((state != "DOWN" && state != "UP") || !extra.empty())
++					return "ERR USAGE DEBUG INPUT ADD <sequence> KEY <key> <DOWN|UP>";
++				replay_input.kind = REMOTE_INPUT_KEY;
++				replay_input.value = static_cast<uint16_t>(key);
++				replay_input.pressed = state == "DOWN";
++				return RemoteReplayInputAdd(replay_input);
++			}
++			if (kind == "MOUSE") {
++				std::string operation;
++				input >> operation;
++				for (auto &ch : operation) ch = static_cast<char>(toupper(ch));
++				if (operation == "MOVE") {
++					std::string x_text, y_text;
++					uint64_t x = 0, y = 0;
++					input >> x_text >> y_text >> extra;
++					if (!RemoteParseDecimalSequence(x_text, x) ||
++					    !RemoteParseDecimalSequence(y_text, y) || x > 32767U || y > 32767U)
++						return "ERR INPUT_MOUSE_COORDINATE_RANGE_0_32767";
++					if (!extra.empty())
++						return "ERR USAGE DEBUG INPUT ADD <sequence> MOUSE MOVE <x> <y>";
++					replay_input.kind = REMOTE_INPUT_MOUSE_MOVE;
++					replay_input.x = static_cast<uint16_t>(x);
++					replay_input.y = static_cast<uint16_t>(y);
++					return RemoteReplayInputAdd(replay_input);
++				}
++				if (operation == "LEFT") {
++					std::string state;
++					input >> state >> extra;
++					for (auto &ch : state) ch = static_cast<char>(toupper(ch));
++					if ((state != "DOWN" && state != "UP") || !extra.empty())
++						return "ERR USAGE DEBUG INPUT ADD <sequence> MOUSE LEFT <DOWN|UP>";
++					replay_input.kind = REMOTE_INPUT_MOUSE_BUTTON;
++					replay_input.pressed = state == "DOWN";
++					return RemoteReplayInputAdd(replay_input);
++				}
++			}
++			return "ERR USAGE DEBUG INPUT ADD <sequence> <KEY|MOUSE> ...";
++		}
++		return "ERR USAGE DEBUG INPUT <STATUS|ADD|LOG|REPLAY|CLEAR>";
++	}
++
+ 	if (command == "REGISTERS") return RemoteRegisterState();
+ 
+ 	if (command == "FILEIO") {
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index 1c866f2..5e370a4 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -142,7 +142,7 @@ static std::string handle_command(const std::string& cmd) {
+                DOSBOX_X_BUILD_ID
+                " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
+ #if C_DEBUG
+-               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,CHECKPOINT,HASH,WAIT,CONTINUE"
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,CHECKPOINT,HASH,INPUT,WAIT,CONTINUE"
+ #else
+                " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
+ #endif
+diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
+index 029bb55..577c578 100644
+--- a/src/gui/sdlmain.cpp
++++ b/src/gui/sdlmain.cpp
+@@ -5614,6 +5614,55 @@ static void HandleMouseButton(SDL_MouseButtonEvent * button, SDL_MouseMotionEven
+     }
+ }
+ 
++#if C_DEBUG
++/* Deterministic replay calls these on the emulator thread at an exact normal-
++ * core instruction boundary. Unlike the legacy control CLICK command, no SDL
++ * queue, host timer, or worker-thread sleep lies between the sequence and the
++ * guest mouse state transition. Coordinates are DOSBox-X window pixels. */
++static uint16_t replay_mouse_x = 0;
++static uint16_t replay_mouse_y = 0;
++
++void GFX_GetReplayMousePosition(uint16_t &x, uint16_t &y)
++{
++	x = replay_mouse_x;
++	y = replay_mouse_y;
++}
++
++void GFX_SetReplayMousePosition(uint16_t x, uint16_t y)
++{
++	replay_mouse_x = x;
++	replay_mouse_y = y;
++}
++
++void GFX_ReplayMouseMove(uint16_t x, uint16_t y)
++{
++	SDL_MouseMotionEvent motion;
++	memset(&motion, 0, sizeof(motion));
++	motion.x = x;
++	motion.y = y;
++	motion.xrel = static_cast<Sint16>(static_cast<int32_t>(x) - replay_mouse_x);
++	motion.yrel = static_cast<Sint16>(static_cast<int32_t>(y) - replay_mouse_y);
++	replay_mouse_x = x;
++	replay_mouse_y = y;
++	HandleMouseMotion(&motion);
++}
++
++void GFX_ReplayMouseButton(bool pressed)
++{
++	SDL_MouseButtonEvent button;
++	SDL_MouseMotionEvent motion;
++	memset(&button, 0, sizeof(button));
++	memset(&motion, 0, sizeof(motion));
++	button.button = SDL_BUTTON_LEFT;
++	button.state = pressed ? SDL_PRESSED : SDL_RELEASED;
++	button.x = replay_mouse_x;
++	button.y = replay_mouse_y;
++	motion.x = replay_mouse_x;
++	motion.y = replay_mouse_y;
++	HandleMouseButton(&button, &motion);
++}
++#endif
++
+ void GFX_LosingFocus(void) {
+     sdl.laltstate=SDL_KEYUP;
+     sdl.raltstate=SDL_KEYUP;

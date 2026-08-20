@@ -1,0 +1,270 @@
+From 4360e8f4c0aa976a7f6dc3d09cc5833e20dd91bf Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 17:55:02 -0400
+Subject: [PATCH 08/19] feat(debugger): add unsafe audited state mutation
+
+---
+ src/debug/debug.cpp | 222 +++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 221 insertions(+), 1 deletion(-)
+
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index 4671895..2ba3e71 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -367,6 +367,8 @@ static std::string remote_debug_request;
+ static std::string remote_debug_response;
+ static bool remote_debug_request_pending = false;
+ static bool remote_debug_response_ready = false;
++static bool remote_oracle_manipulated = false;
++static unsigned int remote_mutation_count = 0;
+ 
+ enum RemoteWatchMode {
+ 	REMOTE_WATCH_READ,
+@@ -4817,6 +4819,8 @@ static std::string RemoteRegisterState(void)
+ 	    << "OK STOPPED=" << (remote_debug_stopped.load() ? 1 : 0)
+ 	    << " REASON=" << RemoteStopReasonName()
+ 	    << " CORE=" << (CPU_IsDynamicCore() ? "DYNAMIC" : "NORMAL")
++	    << " ORACLE=" << (remote_oracle_manipulated ? "MANIPULATED" : "PRISTINE")
++	    << " MUTATIONS=" << std::dec << remote_mutation_count << std::hex
+ 	    << " EAX=" << std::setw(8) << reg_eax
+ 	    << " EBX=" << std::setw(8) << reg_ebx
+ 	    << " ECX=" << std::setw(8) << reg_ecx
+@@ -4847,6 +4851,179 @@ static std::string RemoteRegisterState(void)
+ 	return out.str();
+ }
+ 
++static std::string RemoteHexValue(uint32_t value, unsigned int digits)
++{
++	std::ostringstream out;
++	out << std::hex << std::uppercase << std::setfill('0') << std::setw(digits)
++	    << value;
++	return out.str();
++}
++
++/** Assign a raw CPU register without attempting symbol or type interpretation.
++ * Selector registers are deliberately absent because they require coordinated
++ * protected-mode descriptor and execution-cache updates.
++ *
++ * @param reg Parsed register identifier.
++ * @param value Width-validated raw value.
++ * @return true when the register is writable through this unsafe interface.
++ */
++static bool RemoteWriteRegister(ERemoteConditionRegister reg, uint32_t value)
++{
++	switch (reg) {
++	case REMOTE_REG_EAX: reg_eax = value; break;
++	case REMOTE_REG_EBX: reg_ebx = value; break;
++	case REMOTE_REG_ECX: reg_ecx = value; break;
++	case REMOTE_REG_EDX: reg_edx = value; break;
++	case REMOTE_REG_ESI: reg_esi = value; break;
++	case REMOTE_REG_EDI: reg_edi = value; break;
++	case REMOTE_REG_EBP: reg_ebp = value; break;
++	case REMOTE_REG_ESP: reg_esp = value; break;
++	case REMOTE_REG_EIP: reg_eip = value; break;
++	case REMOTE_REG_FLAGS: CPU_SetFlags(value, FMASK_ALL); break;
++	case REMOTE_REG_AX: reg_ax = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_BX: reg_bx = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_CX: reg_cx = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_DX: reg_dx = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_SI: reg_si = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_DI: reg_di = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_BP: reg_bp = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_SP: reg_sp = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_IP: reg_ip = static_cast<uint16_t>(value); break;
++	case REMOTE_REG_AH: reg_ah = static_cast<uint8_t>(value); break;
++	case REMOTE_REG_AL: reg_al = static_cast<uint8_t>(value); break;
++	case REMOTE_REG_BH: reg_bh = static_cast<uint8_t>(value); break;
++	case REMOTE_REG_BL: reg_bl = static_cast<uint8_t>(value); break;
++	case REMOTE_REG_CH: reg_ch = static_cast<uint8_t>(value); break;
++	case REMOTE_REG_CL: reg_cl = static_cast<uint8_t>(value); break;
++	case REMOTE_REG_DH: reg_dh = static_cast<uint8_t>(value); break;
++	case REMOTE_REG_DL: reg_dl = static_cast<uint8_t>(value); break;
++	default: return false;
++	}
++	return true;
++}
++
++static unsigned int RemoteRegisterDigits(ERemoteConditionRegister reg)
++{
++	switch (reg) {
++	case REMOTE_REG_AH: case REMOTE_REG_AL: case REMOTE_REG_BH: case REMOTE_REG_BL:
++	case REMOTE_REG_CH: case REMOTE_REG_CL: case REMOTE_REG_DH: case REMOTE_REG_DL:
++		return 2;
++	case REMOTE_REG_AX: case REMOTE_REG_BX: case REMOTE_REG_CX: case REMOTE_REG_DX:
++	case REMOTE_REG_SI: case REMOTE_REG_DI: case REMOTE_REG_BP: case REMOTE_REG_SP:
++	case REMOTE_REG_IP:
++		return 4;
++	case REMOTE_REG_EAX: case REMOTE_REG_EBX: case REMOTE_REG_ECX: case REMOTE_REG_EDX:
++	case REMOTE_REG_ESI: case REMOTE_REG_EDI: case REMOTE_REG_EBP: case REMOTE_REG_ESP:
++	case REMOTE_REG_EIP: case REMOTE_REG_FLAGS:
++		return 8;
++	default: return 0;
++	}
++}
++
++static std::string RemoteMutationPrefix(void)
++{
++	std::ostringstream out;
++	out << "OK MUTATED=1 ORACLE=MANIPULATED MUTATIONS=" << remote_mutation_count;
++	return out.str();
++}
++
++/** Mutate one stopped CPU register and prove the stored value by readback.
++ *
++ * @param name Register name accepted by the debugger expression parser.
++ * @param value_text One- to eight-digit hexadecimal value.
++ * @return A bounded response containing before, requested, and readback values.
++ */
++static std::string RemoteMutateRegister(const std::string &name,
++	                                     const std::string &value_text)
++{
++	const ERemoteConditionRegister reg = RemoteParseConditionRegister(name);
++	if (reg == REMOTE_REG_NONE) return "ERR INVALID_REGISTER";
++	const unsigned int digits = RemoteRegisterDigits(reg);
++	if (!digits) return "ERR REGISTER_READ_ONLY";
++	uint32_t value = 0;
++	if (!RemoteParseHex(value_text, value)) return "ERR INVALID_REGISTER_VALUE";
++	if ((digits == 2 && value > 0xffU) || (digits == 4 && value > 0xffffU))
++		return "ERR REGISTER_VALUE_RANGE";
++	const uint32_t before = RemoteConditionRegisterValue(reg);
++	if (!RemoteWriteRegister(reg, value)) return "ERR REGISTER_WRITE";
++	remote_oracle_manipulated = true;
++	++remote_mutation_count;
++	const uint32_t readback = RemoteConditionRegisterValue(reg);
++	if (readback != value) return "ERR REGISTER_READBACK_MISMATCH";
++	return RemoteMutationPrefix() + " TYPE=REGISTER REGISTER=" +
++	       RemoteConditionRegisterName(reg) + " BEFORE=" +
++	       RemoteHexValue(before, digits) + " AFTER=" +
++	       RemoteHexValue(value, digits) + " READBACK=" +
++	       RemoteHexValue(readback, digits);
++}
++
++static std::string RemoteByteList(const std::vector<uint8_t> &bytes)
++{
++	std::ostringstream out;
++	out << std::hex << std::uppercase << std::setfill('0');
++	for (size_t index = 0; index < bytes.size(); ++index) {
++		if (index) out << ',';
++		out << std::setw(2) << static_cast<unsigned int>(bytes[index]);
++	}
++	return out.str();
++}
++
++/** Mutate a bounded selector range while the CPU is stopped.
++ *
++ * The complete range is resolved and snapshotted before the first write.
++ * Checked byte writes avoid unbounded host access, and a complete readback is
++ * required before success is reported.
++ *
++ * @param selector Current protected-mode selector.
++ * @param offset Byte offset within the selector.
++ * @param after One to 64 requested byte values.
++ * @return A bounded response with the original, requested, and readback bytes.
++ */
++static std::string RemoteMutateMemory(uint16_t selector, uint32_t offset,
++	                                  const std::vector<uint8_t> &after)
++{
++	if (after.empty() || after.size() > 64U) return "ERR MEMORY_WRITE_COUNT_RANGE_1_40";
++	if (offset > 0xffffffffU - static_cast<uint32_t>(after.size() - 1U))
++		return "ERR INVALID_ADDRESS";
++	const uint64_t first = GetAddress(selector, offset);
++	const uint64_t last = GetAddress(selector,
++	                                 offset + static_cast<uint32_t>(after.size() - 1U));
++	if (first == mem_no_address || last == mem_no_address ||
++	    last != first + after.size() - 1U || first > 0xffffffffU)
++		return "ERR INVALID_ADDRESS";
++
++	std::vector<uint8_t> before(after.size());
++	for (size_t index = 0; index < before.size(); ++index) {
++		if (mem_readb_checked(static_cast<PhysPt>(first + index), &before[index]))
++			return "ERR MEMORY_READ_BEFORE";
++	}
++
++	remote_oracle_manipulated = true;
++	++remote_mutation_count;
++	for (size_t index = 0; index < after.size(); ++index) {
++		if (!mem_writeb_checked(static_cast<PhysPt>(first + index), after[index])) continue;
++		for (size_t rollback = 0; rollback < index; ++rollback)
++			mem_writeb_checked(static_cast<PhysPt>(first + rollback), before[rollback]);
++		return "ERR MEMORY_WRITE PARTIAL=" + std::to_string(index) +
++		       " ORACLE=MANIPULATED";
++	}
++
++	std::vector<uint8_t> readback(after.size());
++	for (size_t index = 0; index < readback.size(); ++index) {
++		if (mem_readb_checked(static_cast<PhysPt>(first + index), &readback[index]))
++			return "ERR MEMORY_READBACK ORACLE=MANIPULATED";
++	}
++	if (readback != after)
++		return "ERR MEMORY_READBACK_MISMATCH ORACLE=MANIPULATED READBACK=" +
++		       RemoteByteList(readback);
++
++	return RemoteMutationPrefix() + " TYPE=MEMORY ADDRESS=" +
++	       RemoteHexValue(selector, 4) + ":" + RemoteHexValue(offset, 8) +
++	       " COUNT=" + std::to_string(after.size()) + " BEFORE=" +
++	       RemoteByteList(before) + " AFTER=" + RemoteByteList(after) +
++	       " READBACK=" + RemoteByteList(readback);
++}
++
+ static std::string RemoteReadMemory(uint64_t address, uint32_t count)
+ {
+ 	if (address == mem_no_address) return "ERR INVALID_ADDRESS";
+@@ -5097,6 +5274,46 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 
+ 	if (command == "REGISTERS") return RemoteRegisterState();
+ 
++	if (command == "MUTATE") {
++		static const std::string confirmation = "CONFIRM_MANIPULATED_ORACLE";
++		std::string target;
++		input >> target;
++		for (auto &ch : target) ch = static_cast<char>(toupper(ch));
++		if (target == "REGISTER") {
++			std::string name, value, supplied_confirmation, extra;
++			input >> name >> value >> supplied_confirmation >> extra;
++			if (supplied_confirmation != confirmation || !extra.empty())
++				return "ERR CONFIRMATION_REQUIRED CONFIRM_MANIPULATED_ORACLE";
++			return RemoteMutateRegister(name, value);
++		}
++		if (target == "MEMORY") {
++			std::string address_text;
++			input >> address_text;
++			uint16_t selector = 0;
++			uint32_t offset = 0;
++			if (!RemoteParseAddress(address_text, selector, offset))
++				return "ERR INVALID_ADDRESS";
++			std::vector<std::string> tokens;
++			std::string token;
++			while (input >> token) tokens.push_back(token);
++			if (tokens.empty() || tokens.back() != confirmation)
++				return "ERR CONFIRMATION_REQUIRED CONFIRM_MANIPULATED_ORACLE";
++			tokens.pop_back();
++			if (tokens.empty() || tokens.size() > 64U)
++				return "ERR MEMORY_WRITE_COUNT_RANGE_1_40";
++			std::vector<uint8_t> bytes;
++			bytes.reserve(tokens.size());
++			for (const auto &byte_text : tokens) {
++				uint32_t byte = 0;
++				if (byte_text.size() != 2U || !RemoteParseHex(byte_text, byte) || byte > 0xffU)
++					return "ERR INVALID_MEMORY_BYTE";
++				bytes.push_back(static_cast<uint8_t>(byte));
++			}
++			return RemoteMutateMemory(selector, offset, bytes);
++		}
++		return "ERR USAGE DEBUG MUTATE (REGISTER|MEMORY) ... CONFIRM_MANIPULATED_ORACLE";
++	}
++
+ 	if (command == "SELECTOR") {
+ 		std::string token;
+ 		uint32_t selector_value = 0;
+@@ -5565,7 +5782,10 @@ bool DEBUG_RemoteCommand(const char *command, char *response,
+ 
+ 	if (verb == "STATUS") {
+ 		remote_debug_response = remote_debug_stopped.load() ?
+-		                        RemoteRegisterState() : "OK STOPPED=0 REASON=RUNNING";
++		                        RemoteRegisterState() :
++		                        std::string("OK STOPPED=0 REASON=RUNNING ORACLE=") +
++		                        (remote_oracle_manipulated ? "MANIPULATED" : "PRISTINE") +
++		                        " MUTATIONS=" + std::to_string(remote_mutation_count);
+ 	} else if (verb == "PAUSE") {
+ 		remote_debug_enabled.store(true);
+ 		if (!remote_debug_stopped.load()) {

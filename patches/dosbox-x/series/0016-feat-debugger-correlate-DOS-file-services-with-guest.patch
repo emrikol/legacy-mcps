@@ -1,0 +1,270 @@
+From 8d2e2c2aaa01adc9b9593d5e2a727c0a42501c20 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 22:00:17 -0400
+Subject: [PATCH 16/19] feat(debugger): correlate DOS file services with guest
+ callers
+
+---
+ include/debug.h               |  2 +
+ include/tool_build_identity.h |  2 +-
+ src/debug/debug.cpp           | 92 ++++++++++++++++++++++++++++++++++-
+ src/dos/dos_files.cpp         |  8 ++-
+ 4 files changed, 100 insertions(+), 4 deletions(-)
+
+diff --git a/include/debug.h b/include/debug.h
+index 4a4401c..0fb7a18 100644
+--- a/include/debug.h
++++ b/include/debug.h
+@@ -47,6 +47,7 @@ enum DEBUG_FileIoOperation {
+ #if C_DEBUG
+ void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
+                          uint16_t call_cs, uint32_t call_eip,
++                         uint16_t call_ss, uint32_t call_ebp,
+                          uint16_t guest_handle, uint32_t system_handle,
+                          bool fcb, const char *path, const char *path2,
+                          bool success, uint16_t error, uint32_t requested,
+@@ -56,6 +57,7 @@ void DEBUG_FileIoHandleClosed(uint32_t system_handle);
+ #else
+ static inline void DEBUG_FileIoObserve(DEBUG_FileIoOperation, uint16_t,
+                                        uint16_t, uint32_t, uint16_t, uint32_t,
++                                       uint16_t, uint32_t,
+                                        bool, const char *, const char *, bool,
+                                        uint16_t, uint32_t, uint32_t, uint32_t,
+                                        uint32_t, uint32_t) {}
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+index 1978e40..32cb4cc 100644
+--- a/include/tool_build_identity.h
++++ b/include/tool_build_identity.h
+@@ -1,2 +1,2 @@
+ /* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
+-#define DOSBOX_X_BUILD_ID "9e046d7a5154a4a823586edc7a5854beea25f7032d5c6f58ad2fb9c1e1496d94"
++#define DOSBOX_X_BUILD_ID "e1ef159ae380939117c7ad8fa6e2f091b4d31f429629da6c47210e9d4c1594d7"
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index 7390528..c8933bc 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -488,10 +488,15 @@ void DEBUG_RemoteInstructionRetired(void)
+ 
+ struct RemoteFileIoEvent {
+ 	uint64_t sequence;
++	uint64_t instruction_sequence;
+ 	DEBUG_FileIoOperation operation;
+ 	uint16_t psp;
+ 	uint16_t call_cs;
+ 	uint32_t call_eip;
++	uint16_t call_ss;
++	uint32_t call_ebp;
++	std::string call_stack_end;
++	std::vector<std::pair<uint16_t, uint32_t> > callers;
+ 	uint16_t guest_handle;
+ 	uint32_t system_handle;
+ 	bool fcb;
+@@ -516,6 +521,9 @@ static uint64_t remote_fileio_dropped = 0;
+ static std::deque<RemoteFileIoEvent> remote_fileio_events;
+ static std::map<uint32_t, uint64_t> remote_fileio_offsets;
+ 
++/* Selector translation is defined with the debugger helpers below. */
++uint64_t GetAddress(uint16_t seg, uint32_t offset);
++
+ /* A bounded, non-stopping probe records entry stack bytes at exact protected-
+  * mode addresses. Host plans attach Win16 message/API meaning; the emulator
+  * deliberately knows nothing about USER/GDI calling conventions. */
+@@ -528,6 +536,7 @@ struct RemoteApiTraceProbe {
+ 
+ struct RemoteApiTraceEvent {
+ 	uint64_t sequence;
++	uint64_t instruction_sequence;
+ 	unsigned int probe_id;
+ 	uint16_t cs;
+ 	uint32_t eip;
+@@ -545,6 +554,12 @@ static std::vector<RemoteApiTraceProbe> remote_api_trace_probes;
+ static std::deque<RemoteApiTraceEvent> remote_api_trace_events;
+ static CPU_Decoder *remote_api_trace_saved_decoder = NULL;
+ 
++/* FILEIO callbacks execute below the CPU dispatch boundary while APITRACE
++ * probes execute at instruction entry. A shared monotonically increasing
++ * instruction sequence lets the host establish their exact order without
++ * pretending that the real-mode DOS service stack is a Win16 task stack. */
++static uint64_t remote_observer_instruction_sequence = 0;
++
+ /* Code coverage is deliberately an address collector, not a disassembler.
+  * A reviewed host plan gives exact Win16 basic-block boundaries meaning; the
+  * emulator only records which instruction addresses actually executed inside
+@@ -604,8 +619,62 @@ static std::string RemoteFileIoBoundedPath(const char *path)
+ 	return std::string(path, length);
+ }
+ 
++static void RemoteFileIoCaptureCallers(RemoteFileIoEvent &event)
++{
++	if (cpu.stack.big) {
++		event.call_stack_end = "32BIT_STACK";
++		return;
++	}
++	uint16_t frame_bp = static_cast<uint16_t>(event.call_ebp);
++	uint16_t frame_cs = event.call_cs;
++	std::set<uint16_t> visited;
++	event.call_stack_end = "LIMIT";
++	for (size_t index = 0; index < 16U; ++index) {
++		if (!frame_bp) {
++			event.call_stack_end = "ZERO_BP";
++			break;
++		}
++		if (!visited.insert(frame_bp).second) {
++			event.call_stack_end = "CYCLE";
++			break;
++		}
++		if (frame_bp > 0xfffcU) {
++			event.call_stack_end = "FRAME_RANGE";
++			break;
++		}
++		const uint64_t bp_address = GetAddress(event.call_ss, frame_bp);
++		const uint64_t ip_address = GetAddress(event.call_ss, frame_bp + 2U);
++		uint16_t saved_bp = 0;
++		uint16_t return_ip = 0;
++		if (bp_address == (~0ULL) || ip_address != bp_address + 2U ||
++		    mem_readw_checked(static_cast<PhysPt>(bp_address), &saved_bp) ||
++		    mem_readw_checked(static_cast<PhysPt>(ip_address), &return_ip)) {
++			event.call_stack_end = "UNREADABLE";
++			break;
++		}
++		const bool far_frame = (saved_bp & 1U) != 0;
++		uint16_t return_cs = frame_cs;
++		if (far_frame) {
++			if (frame_bp > 0xfffaU) {
++				event.call_stack_end = "FRAME_RANGE";
++				break;
++			}
++			const uint64_t cs_address = GetAddress(event.call_ss, frame_bp + 4U);
++			if (cs_address != bp_address + 4U ||
++			    mem_readw_checked(static_cast<PhysPt>(cs_address), &return_cs)) {
++				event.call_stack_end = "UNREADABLE";
++				break;
++			}
++		}
++		event.callers.push_back(std::make_pair(return_cs, return_ip));
++		frame_bp = far_frame ? static_cast<uint16_t>(saved_bp - 1U) : saved_bp;
++		frame_cs = return_cs;
++	}
++}
++
+ void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
+ 	                     uint16_t call_cs, uint32_t call_eip,
++	                     uint16_t call_ss, uint32_t call_ebp,
+ 	                     uint16_t guest_handle, uint32_t system_handle,
+ 	                     bool fcb, const char *path, const char *path2,
+ 	                     bool success, uint16_t error, uint32_t requested,
+@@ -615,10 +684,14 @@ void DEBUG_FileIoObserve(DEBUG_FileIoOperation operation, uint16_t psp,
+ 	if (!remote_fileio_active) return;
+ 	RemoteFileIoEvent event;
+ 	event.sequence = remote_fileio_next_sequence++;
++	event.instruction_sequence = remote_observer_instruction_sequence;
+ 	event.operation = operation;
+ 	event.psp = psp;
+ 	event.call_cs = call_cs;
+ 	event.call_eip = call_eip;
++	event.call_ss = call_ss;
++	event.call_ebp = call_ebp;
++	RemoteFileIoCaptureCallers(event);
+ 	event.guest_handle = guest_handle;
+ 	event.system_handle = system_handle;
+ 	event.fcb = fcb;
+@@ -5407,13 +5480,24 @@ static std::string RemoteFileIoDrain(size_t count)
+ 	for (size_t index = 0; index < drained; ++index) {
+ 		const RemoteFileIoEvent &event = remote_fileio_events.front();
+ 		out << "\nSEQ=" << event.sequence
++		    << " ISEQ=" << event.instruction_sequence
+ 		    << " OP=" << RemoteFileIoOperationName(event.operation)
+ 		    << " SUCCESS=" << (event.success ? 1 : 0)
+ 		    << " ERROR=" << std::hex << std::uppercase << std::setfill('0')
+ 		    << std::setw(4) << event.error
+ 		    << " PSP=" << std::setw(4) << event.psp
+ 		    << " SITE=" << std::setw(4) << event.call_cs << ":"
+-		    << std::setw(8) << event.call_eip << std::dec
++		    << std::setw(8) << event.call_eip
++		    << " SS:BP=" << std::setw(4) << event.call_ss << ":"
++		    << std::setw(8) << event.call_ebp
++		    << " CALLERS=";
++		if (event.callers.empty()) out << "-";
++		else for (size_t caller_index = 0; caller_index < event.callers.size(); ++caller_index) {
++			if (caller_index) out << ",";
++			out << std::setw(4) << event.callers[caller_index].first << ":"
++			    << std::setw(8) << event.callers[caller_index].second;
++		}
++		out << " STACKEND=" << event.call_stack_end << std::dec
+ 		    << " GH=";
+ 		RemoteFileIoOptionalHex(out, event.guest_handle != UINT16_MAX,
+ 		                        event.guest_handle, 4);
+@@ -5464,6 +5548,7 @@ static std::string RemoteApiTraceDrain(size_t count)
+ 	for (size_t index = 0; index < drained; ++index) {
+ 		const RemoteApiTraceEvent &event = remote_api_trace_events.front();
+ 		out << "\nSEQ=" << event.sequence
++		    << " ISEQ=" << event.instruction_sequence
+ 		    << " ID=" << event.probe_id
+ 		    << " SITE=" << std::hex << std::uppercase << std::setfill('0')
+ 		    << std::setw(4) << event.cs << ":" << std::setw(8) << event.eip
+@@ -5524,6 +5609,7 @@ static void RemoteApiTraceObserve(void)
+ 		if (probe.selector != SegValue(cs) || probe.offset != reg_eip) continue;
+ 		RemoteApiTraceEvent event;
+ 		event.sequence = remote_api_trace_next_sequence++;
++		event.instruction_sequence = remote_observer_instruction_sequence;
+ 		event.probe_id = probe.id;
+ 		event.cs = SegValue(cs);
+ 		event.eip = reg_eip;
+@@ -6334,6 +6420,7 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			remote_fileio_capacity = capacity;
+ 			remote_fileio_next_sequence = 0;
+ 			remote_fileio_dropped = 0;
++			if (!remote_api_trace_active) remote_observer_instruction_sequence = 0;
+ 			remote_fileio_active = true;
+ 			return RemoteFileIoStatus();
+ 		}
+@@ -6411,6 +6498,7 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 			remote_api_trace_capacity = static_cast<size_t>(capacity);
+ 			remote_api_trace_next_sequence = 0;
+ 			remote_api_trace_dropped = 0;
++			if (!remote_fileio_active) remote_observer_instruction_sequence = 0;
+ 			remote_api_trace_active = true;
+ 			return RemoteApiTraceStatus();
+ 		}
+@@ -8848,6 +8936,8 @@ void DEBUG_HeavyWriteLogInstruction(void) {
+ }
+ 
+ bool DEBUG_HeavyIsBreakpoint(void) {
++	if (remote_fileio_active || remote_api_trace_active)
++		++remote_observer_instruction_sequence;
+ 	if (remote_watch_pending.exchange(false)) {
+ 		remote_debug_enabled.store(true);
+ 		return true;
+diff --git a/src/dos/dos_files.cpp b/src/dos/dos_files.cpp
+index 3053fbe..eff34ce 100644
+--- a/src/dos/dos_files.cpp
++++ b/src/dos/dos_files.cpp
+@@ -65,7 +65,8 @@ public:
+ 	                     const char *path_value = NULL,
+ 	                     const char *path2_value = NULL)
+ 	        : operation(operation_value), psp(dos.psp()), call_cs(SegValue(cs)),
+-	          call_eip(reg_eip), guest_handle(UINT16_MAX),
++	          call_eip(reg_eip), call_ss(SegValue(ss)), call_ebp(reg_ebp),
++	          guest_handle(UINT16_MAX),
+ 	          system_handle(UINT32_MAX), fcb(false),
+ 	          path(path_value ? path_value : ""),
+ 	          path2(path2_value ? path2_value : ""), success(false),
+@@ -74,7 +75,8 @@ public:
+ 
+ 	~DOSFileIoObservation()
+ 	{
+-		DEBUG_FileIoObserve(operation, psp, call_cs, call_eip, guest_handle,
++		DEBUG_FileIoObserve(operation, psp, call_cs, call_eip, call_ss,
++		                    call_ebp, guest_handle,
+ 		                    system_handle, fcb, path.empty() ? NULL : path.c_str(),
+ 		                    path2.empty() ? NULL : path2.c_str(), success,
+ 		                    success ? 0 : dos.errorcode, requested, actual,
+@@ -85,6 +87,8 @@ public:
+ 	uint16_t psp;
+ 	uint16_t call_cs;
+ 	uint32_t call_eip;
++	uint16_t call_ss;
++	uint32_t call_ebp;
+ 	uint16_t guest_handle;
+ 	uint32_t system_handle;
+ 	bool fcb;

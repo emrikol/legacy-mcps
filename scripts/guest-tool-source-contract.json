@@ -1,0 +1,33 @@
+{
+  "format": "legacy-mcps-guest-tool-source-contract-v1",
+  "tools": {
+    "DOSMCP": {
+      "paths": [
+        "dos-mcp/Makefile",
+        "dos-mcp/src/dosmcp.asm"
+      ],
+      "output": "dos-mcp/src/tool_build_identity.inc",
+      "macro": "DOSMCP_BUILD_ID",
+      "buildBinary": "dos-mcp/src/DOSMCP.COM",
+      "trackedBinary": "share/DOSMCP.COM",
+      "companions": []
+    },
+    "WINMCP": {
+      "paths": [
+        "win-mcp/src/Makefile",
+        "win-mcp/src/winmchk.c",
+        "win-mcp/src/winmcp.c"
+      ],
+      "output": "win-mcp/src/tool_build_identity.h",
+      "macro": "WINMCP_BUILD_ID",
+      "buildBinary": "win-mcp/src/WINMCP.EXE",
+      "trackedBinary": "share/WINMCP.EXE",
+      "companions": [
+        {
+          "buildBinary": "win-mcp/src/WINMCHK.DLL",
+          "trackedBinary": "share/WINMCHK.DLL"
+        }
+      ]
+    }
+  }
+}

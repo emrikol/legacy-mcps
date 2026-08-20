@@ -1,0 +1,22 @@
+{
+  "format": "legacy-mcps-dosbox-x-source-contract-v1",
+  "paths": [
+    "build-macos",
+    "include/debug.h",
+    "include/paging.h",
+    "include/pic.h",
+    "include/render.h",
+    "src/cpu/core_normal.cpp",
+    "src/cpu/cpu.cpp",
+    "src/debug/debug.cpp",
+    "src/dos/dos.cpp",
+    "src/dos/dos_files.cpp",
+    "src/gui/Makefile.am",
+    "src/gui/dosbox_control_server.cpp",
+    "src/gui/render.cpp",
+    "src/gui/sdlmain.cpp",
+    "src/hardware/cmos.cpp",
+    "src/hardware/hardware.cpp",
+    "src/hardware/pic.cpp"
+  ]
+}

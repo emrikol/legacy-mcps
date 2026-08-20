@@ -1,0 +1,187 @@
+From 941269ad94926481b26a028637bc5d4e256a8eec Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 17:00:00 -0400
+Subject: [PATCH 06/19] feat(debugger): add atomic remote command batches
+
+---
+ src/debug/debug.cpp               | 107 ++++++++++++++++++++++++++++++
+ src/gui/dosbox_control_server.cpp |  34 +++++++---
+ 2 files changed, 133 insertions(+), 8 deletions(-)
+
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index 0f4a797..caa7932 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -4882,6 +4882,107 @@ static void RemoteStepOneInstruction(bool inhibit_events = false)
+ 	cpudecoder = configured_decoder;
+ }
+ 
++static std::string RemoteExecuteCommand(const std::string &request,
++                                        bool &resume);
++
++static bool RemoteBatchCommandCanResume(const std::string &request)
++{
++	std::istringstream input(request);
++	std::string command;
++	input >> command;
++	for (auto &ch : command) ch = static_cast<char>(toupper(ch));
++	return command == "CONTINUE" || command == "NEXT" || command == "RUN" ||
++	       command == "PAUSE" || command == "WAIT" || command == "STATUS";
++}
++
++static std::string RemoteBatchResponse(const std::vector<std::string> &responses,
++	                                    bool success, unsigned int failed_index)
++{
++	std::ostringstream out;
++	if (success)
++		out << "OK BATCH N=" << responses.size();
++	else
++		out << "ERR BATCH INDEX=" << failed_index << " N=" << responses.size();
++	for (const auto &response : responses)
++		out << " " << response.size() << ":" << response;
++	return out.str();
++}
++
++/** Execute several stopped-CPU debugger operations without returning control
++ * to the emulator loop between them.
++ *
++ * The wire format is a decimal command count followed by length-prefixed
++ * command strings. Length framing lets commands and responses contain spaces
++ * and newlines without inventing an escaping convention. A batch is an atomic
++ * scheduling unit, not a transaction: an ordinary command error stops later
++ * commands but does not undo earlier breakpoint or CPU-state changes.
++ */
++static std::string RemoteExecuteBatch(const std::string &payload)
++{
++	static const unsigned int maximum_commands = 8;
++	static const unsigned int maximum_command_length = 512;
++	static const size_t maximum_response_length = 14000;
++	size_t cursor = 0;
++	while (cursor < payload.size() && payload[cursor] == ' ') ++cursor;
++	const size_t count_start = cursor;
++	while (cursor < payload.size() && isdigit(static_cast<unsigned char>(payload[cursor])))
++		++cursor;
++	if (cursor == count_start || cursor >= payload.size() || payload[cursor] != ' ')
++		return "ERR BATCH_SYNTAX";
++	const unsigned long parsed_count = strtoul(payload.substr(count_start,
++	                                                cursor - count_start).c_str(),
++	                                           NULL, 10);
++	if (!parsed_count || parsed_count > maximum_commands)
++		return "ERR BATCH_COUNT_RANGE_1_8";
++	++cursor;
++
++	std::vector<std::string> commands;
++	commands.reserve(static_cast<size_t>(parsed_count));
++	for (unsigned long index = 0; index < parsed_count; ++index) {
++		const size_t length_start = cursor;
++		while (cursor < payload.size() &&
++		       isdigit(static_cast<unsigned char>(payload[cursor]))) ++cursor;
++		if (cursor == length_start || cursor >= payload.size() || payload[cursor] != ':')
++			return "ERR BATCH_SYNTAX";
++		const unsigned long command_length = strtoul(
++		        payload.substr(length_start, cursor - length_start).c_str(), NULL, 10);
++		++cursor;
++		if (!command_length || command_length > maximum_command_length)
++			return "ERR BATCH_COMMAND_LENGTH_RANGE_1_512";
++		if (command_length > payload.size() - cursor) return "ERR BATCH_TRUNCATED";
++		const std::string command = payload.substr(cursor,
++		                                                static_cast<size_t>(command_length));
++		cursor += static_cast<size_t>(command_length);
++		if (command.find('\r') != std::string::npos ||
++		    command.find('\n') != std::string::npos)
++			return "ERR BATCH_COMMAND_NEWLINE";
++		std::istringstream command_input(command);
++		std::string verb;
++		command_input >> verb;
++		for (auto &ch : verb) ch = static_cast<char>(toupper(ch));
++		if (verb == "BATCH") return "ERR BATCH_NESTED";
++		if (RemoteBatchCommandCanResume(command)) return "ERR BATCH_RESUME_FORBIDDEN";
++		commands.push_back(command);
++	}
++	if (cursor != payload.size()) return "ERR BATCH_TRAILING_DATA";
++
++	std::vector<std::string> responses;
++	responses.reserve(commands.size());
++	for (unsigned int index = 0; index < commands.size(); ++index) {
++		bool resume = false;
++		const std::string response = RemoteExecuteCommand(commands[index], resume);
++		if (resume) return "ERR BATCH_INTERNAL_RESUME";
++		if (response.size() > maximum_response_length ||
++		    RemoteBatchResponse(responses, true, 0).size() + response.size() + 24U >
++		            maximum_response_length)
++			return "ERR BATCH_RESPONSE_TOO_LARGE";
++		responses.push_back(response);
++		if (response.compare(0, 3, "ERR") == 0)
++			return RemoteBatchResponse(responses, false, index);
++	}
++	return RemoteBatchResponse(responses, true, 0);
++}
++
+ static std::string RemoteExecuteCommand(const std::string &request,
+                                         bool &resume)
+ {
+@@ -4891,6 +4992,12 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 	input >> command;
+ 	for (auto &ch : command) ch = static_cast<char>(toupper(ch));
+ 
++	if (command == "BATCH") {
++		const std::string::size_type separator = request.find(' ');
++		if (separator == std::string::npos) return "ERR BATCH_SYNTAX";
++		return RemoteExecuteBatch(request.substr(separator + 1));
++	}
++
+ 	if (command == "REGISTERS") return RemoteRegisterState();
+ 
+ 	if (command == "SELECTOR") {
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index cb1fad7..30c32bf 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -163,7 +163,7 @@ static std::string handle_command(const std::string& cmd) {
+             if (end && *end == '\0' && requested >= 1 && requested <= 300000)
+                 timeout_ms = static_cast<unsigned int>(requested);
+         }
+-        char response[16384];
++        char response[65536];
+         DEBUG_RemoteCommand(debug_command.c_str(), response,
+                             sizeof(response), timeout_ms);
+         return std::string(response);
+@@ -439,13 +439,31 @@ static void server_loop() {
+         int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &addr_len);
+         if (client_fd < 0) continue;
+ 
+-        /* Read command (one line per connection) */
+-        char buf[1024];
+-        ssize_t n = read(client_fd, buf, sizeof(buf) - 1);
+-        if (n > 0) {
+-            buf[n] = '\0';
+-            std::string response = handle_command(std::string(buf));
+-            write(client_fd, response.c_str(), response.length());
++        /* Read one bounded command line. A loop is required because even a
++         * localhost TCP write may arrive in multiple packets. */
++        char buf[16384];
++        size_t used = 0;
++        while (used < sizeof(buf) - 1) {
++            ssize_t n = read(client_fd, buf + used, sizeof(buf) - 1 - used);
++            if (n <= 0) break;
++            used += static_cast<size_t>(n);
++            if (memchr(buf, '\n', used)) break;
++        }
++        if (used > 0) {
++            buf[used] = '\0';
++            std::string response;
++            if (used == sizeof(buf) - 1 && !memchr(buf, '\n', used))
++                response = "ERR COMMAND_TOO_LONG\n";
++            else
++                response = handle_command(std::string(buf, used));
++            size_t sent = 0;
++            while (sent < response.length()) {
++                const ssize_t written = write(client_fd, response.c_str() + sent,
++                                              response.length() - sent);
++                if (written < 0 && errno == EINTR) continue;
++                if (written <= 0) break;
++                sent += static_cast<size_t>(written);
++            }
+         }
+ 
+         close(client_fd);

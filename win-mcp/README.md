@@ -6,9 +6,9 @@ A Win16 application that runs inside Windows 3.x and exposes the Windows API via
 
 ## Overview
 
-WINMCP.EXE is a hidden Win16 application (~20KB NE executable) that:
+WINMCP.EXE is a hidden Win16 NE application that:
 
-1. Creates an invisible window with a 200ms timer
+1. Creates an invisible window with a 50 ms automation timer
 2. Polls `_MAGIC_\__WIN__.TX` for commands
 3. Dispatches commands to Windows API handlers
 4. Writes responses to `_MAGIC_\__WIN__.RX`
@@ -18,9 +18,9 @@ It runs alongside the DOS TSR without conflict — each has its own IPC channel.
 ## Building
 
 ```bash
-cd src && make              # Compile with Open Watcom → WINMCP.EXE
-cd src && make deploy       # Copy to share/ and win31-hdd/
-make testwin                # Build + boot Windows 3.1 + run 75 tests
+make -C src             # Compile with Open Watcom → WINMCP.EXE
+make -C src deploy      # Copy to share/ and win31-hdd/
+make testwin            # Build, boot Windows 3.1, and run the harness
 ```
 
 ### Requirements
@@ -29,6 +29,14 @@ make testwin                # Build + boot Windows 3.1 + run 75 tests
 - DOSBox-X (`tools/dosbox-x`) — boots Windows 3.1 for testing
 - Node.js — runs the test harness
 - nasm — assembles the DOS stub (WINSTUB.COM)
+
+### Launching the test VM
+
+`win-mcp/dosbox-run.sh` starts the configured DOSBox-X binary, records its PID,
+waits for the loopback control endpoint, and asks the emulator to minimize its
+window. Review the script and configuration before using it in an unattended
+environment; it launches a real Windows session and is not a headless test
+contract.
 
 ## Auto-start
 
@@ -53,8 +61,9 @@ Parameters in `<angle brackets>` are required. Parameters in `[square brackets]`
 | Command | Response | Description |
 |---|---|---|
 | `META PING` | `OK PONG` | Liveness check |
-| `META VERSION` | `OK WINMCP/0.3 META,PROFILE,...` | Version and capability list |
-| `META STATUS` | `OK CMDS=42 POLL=200ms` | Command count and poll interval |
+| `META IDENTITY` | `OK TOOL=WINMCP PROTOCOL=... BUILD=... FEATURES=...` | Source-derived build identity and exact capabilities |
+| `META VERSION` | `OK WINMCP/0.9 META,PROFILE,...` | Version and capability list |
+| `META STATUS` | `OK CMDS=42 POLL=50ms` | Command count and poll interval |
 | `META QUIT` | `OK` | Clean shutdown |
 
 ---
@@ -188,7 +197,97 @@ Uses the Windows INI caching system. Safer than direct file editing while Window
 | Command | Response | Description |
 |---|---|---|
 | `TASK LIST` | `OK 0F47:NOTEPAD 0E8B:WINMCP ...` | All running tasks (htask:module) |
+| `TASK INFO <module-or-htask>` | `OK TASK=... SS:SP=...` | Task handles, module, stack selector/pointer, bounds, and event count |
+| `TASK CSIP <module-or-htask>` | `OK TASK=... CS:IP=...` | Current task instruction address |
+| `TASK STACK <module-or-htask>` | `OK #0=... #1=...` | ToolHelp stack trace with module and segment numbers |
 | `TASK KILL <htask>` | `OK` | TerminateApp |
+
+---
+
+### MODULE / MEMORY — Protected-mode inspection
+
+These commands use Windows 3.1 `TOOLHELP.DLL`. They understand protected-mode
+selectors and therefore can inspect a running Win16 task in places DOSMCP's
+real-mode memory commands cannot address reliably.
+
+| Command | Response | Description |
+|---|---|---|
+| `MODULE LIST` | `OK hmodule:name:path ...` | Enumerate loaded Win16 modules |
+| `MODULE INFO <name>` | `OK MODULE=... HMODULE=...` | Resolve a module and report its path and use count |
+| `MODULE SEGMENTS <name> [start] [count]` | `OK ... NEXT=n` | Enumerate up to 32 loaded segments, including sparse tables; default page size is 12 |
+| `MODULE PROC <name> <proc-or-#ordinal>` | `OK ... ADDRESS=ssss:oooo` | Resolve an exact loaded Win16 export for read-only API tracing |
+| `MEMORY READ <selector>:<offset> [count]` | `OK ... N=n bytes...` | Read 1–512 bytes; default is 16 |
+| `MEMORY WRITE UNSAFE <selector>:<offset> <bytes...>` | `OK MUTATED=1 ... BEFORE=... AFTER=...` | Write 1–64 bytes with read-back verification |
+
+Selectors are assigned when Windows loads a module and may change after every
+boot. Discover the current selector instead of retaining one from an earlier
+session. Segment tables may be sparse because movable code is discardable;
+continue at `NEXT` until it is zero.
+
+### HEAP — Win16 handles, resources, and USER/GDI objects
+
+These read-only ToolHelp commands expose allocation metadata without treating
+movable handles as stable pointers:
+
+| Command | Response | Description |
+|---|---|---|
+| `HEAP SUMMARY` | `OK GLOBAL=... USER_HEAP=... GDI_HEAP=...` | Global-memory totals and USER/GDI heap handles |
+| `HEAP GLOBAL [start] [count]` | `OK ... ENTRY=... NEXT=n` | Page through global allocations and resources; count is 1–24 |
+| `HEAP HANDLE <handle>` | `OK ENTRY=...` | Validate and describe one global handle |
+| `HEAP LOCAL <heap> [start] [count]` | `OK ... ENTRY=... NEXT=n` | Page a ToolHelp-confirmed local heap; count is 1–24 |
+
+`HEAP HANDLE` returns `ERR INVALID_HANDLE` for a stale or unsupported handle.
+`HEAP LOCAL` also returns `ERR NO_LOCAL_HEAP` unless the validated global entry
+reports a local heap. Selectors and local addresses are snapshot-scoped only.
+Callers building complete snapshots should page until `NEXT=0`, retain the
+module/task inventory used for owner correlation, and treat every handle and
+selector as snapshot-scoped.
+
+#### Unsafe mutation and provenance
+
+Direct writes exist to construct transient diagnostic states without replaying
+long UI flows. They are deliberately separate from inspection and require an
+explicit host confirmation:
+
+The raw command is deliberately conspicuous:
+
+```
+MEMORY WRITE UNSAFE 14EF:0010 00
+```
+
+WINMCP reads the original bytes, writes at most 64 bytes while cooperative
+Win16 scheduling keeps the target task from running, reads the bytes back, and
+attempts rollback if verification fails. Successful writes append an entry to
+`_MAGIC_\\__WIN__.MW`. Any session modified this way is diagnostic evidence
+only and must not be presented as an unmodified guest observation. Prefer
+repeatable guest inputs or disk fixtures when they can express the state.
+
+#### Build and verification
+
+```bash
+cd win-mcp/src
+make clean all
+make deploy
+
+cd ..
+make testwin
+```
+
+`src/Makefile` builds and deploys `WINMCP.EXE`; the parent Makefile's `deploy`
+target is for `WINSTUB.COM`. After deploying, restart Windows so the guest
+loads the new executable, then confirm `META VERSION` advertises `MODULE` and
+`MEMORY`. The live test suite exercises task/module lookup, stack and CS:IP,
+segment pagination, bounded reads, and a verified same-byte write.
+
+The harness waits for the READY file rather than relying on a fixed startup
+sleep. `make testwin` sets `DOSBOX_HEADLESS=1` and SDL's dummy video driver;
+the ordinary launcher remains visible unless that environment variable is set.
+A Windows test still requires licensed guest media. The timeout flags can help
+diagnose a slow or broken boot:
+
+```bash
+node test-harness.js --timeout 120 --ready-timeout 15
+```
 
 ---
 
@@ -249,6 +348,7 @@ All parameters are hex. Common messages:
 | `DIALOG LIST <hwnd>` | `OK 1:Button:OK 2:Button:Cancel ...` | List controls (id:class:text) |
 | `DIALOG GET <hwnd> <id>` | `OK <text>` | GetDlgItemText |
 | `DIALOG SET <hwnd> <id> <text>` | `OK` | SetDlgItemText |
+| `DIALOG TYPE <hwnd> <id> <text>` | `OK` | Type through WM_CHAR into a control selected by dialog ID |
 | `DIALOG CLICK <hwnd> <id>` | `OK` | Click button via BM_CLICK |
 
 ---
@@ -375,6 +475,7 @@ Playwright-style locator that finds child windows by class and/or text.
 | Command | Response | Description |
 |---|---|---|
 | `CONTROL FIND <hwnd> <class> <text>` | `OK <child_hwnd>` | Find first matching child |
+| `CONTROL FINDID <hwnd> <id>` | `OK <child_hwnd>` | Resolve one unique direct child ID without reading its text |
 
 Use `*` as wildcard for class or text.
 
@@ -443,6 +544,11 @@ Commands that poll with an internal message pump, keeping Windows responsive.
 |---|---|---|
 | `WAITFOR <hwnd> <id> <text> [ms]` | `OK MATCH` or `OK MISMATCH:<actual>` | Poll until text matches |
 | `EXPECT <hwnd> <id> <text>` | `OK MATCH` or `OK MISMATCH:<actual>` | Immediate text check |
+
+`CONTROL FINDID` resolves one unique direct child by numeric dialog ID,
+including an Edit control with password styling. Duplicate IDs fail as
+ambiguous rather than silently selecting the first match. This is a privileged
+debugging interface: callers with mailbox access can inspect all control text.
 
 ---
 

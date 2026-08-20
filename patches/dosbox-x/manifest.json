@@ -1,0 +1,29 @@
+{
+  "format": "legacy-mcps-dosbox-x-patch-series-v1",
+  "upstream": "https://github.com/joncampbell123/dosbox-x.git",
+  "baseCommit": "6139ebb37ff52591017c0d511b6696be4029c853",
+  "baseTree": "e5726895b79282d5ab3f125df62b3c7efbef300b",
+  "finalTree": "58fa6630acb7c3c754b228466690323a5295f40c",
+  "sourceContractDigest": "f415471a9a59821ab0284afcca99241d50a9cb9494e53a08aa4d34ed900e93bf",
+  "patches": [
+    { "path": "patches/dosbox-x/series/0001-fix-screenshot-PNG-color-correction-for-macOS-SDL.patch", "sha256": "f84f473f4d60d6442b4144301012bb9aaccf7b634bc308308f6101f4484c093a" },
+    { "path": "patches/dosbox-x/series/0002-feat-add-ALT-CTRL-SHIFT-modifier-support-CLICK-comma.patch", "sha256": "5e440379c428c06e83d13854863bafa1f5f0f7154f48ed113d4ef938b1ddf6e7" },
+    { "path": "patches/dosbox-x/series/0003-feat-main-thread-mouse-click-dispatch-for-control-se.patch", "sha256": "82d838df8965b91ac29853627d58a4abe632373b5fbd8cd587881405731b6425" },
+    { "path": "patches/dosbox-x/series/0004-feat-debugger-add-remote-Win16-inspection-controls.patch", "sha256": "18f246fab94e5afc629eb0690ad6fbb057fbadb248c9dc22df8917f7605145de" },
+    { "path": "patches/dosbox-x/series/0005-feat-control-expose-debugger-and-window-minimize.patch", "sha256": "f2b188c4db64020fe22209aaa872a28891d8e7806c0fedf130c87d6fb0e17b4f" },
+    { "path": "patches/dosbox-x/series/0006-feat-debugger-add-atomic-remote-command-batches.patch", "sha256": "c31235f3f5e5f7bb23c907f14dfa6df0aeb525d0f7851358fbceec09106e1eb9" },
+    { "path": "patches/dosbox-x/series/0007-feat-add-remote-memory-watchpoints.patch", "sha256": "df187b466b5fa57f4a56b756d89c7ca5114b3ae315b5270ffb8ff3335baad585" },
+    { "path": "patches/dosbox-x/series/0008-feat-debugger-add-unsafe-audited-state-mutation.patch", "sha256": "57b46a5c3590c2df47c26ee80e762867493fe1edfec118ec12ac694622953e65" },
+    { "path": "patches/dosbox-x/series/0009-feat-control-expose-reproducible-build-identity.patch", "sha256": "5fa7fa3e4ef7f3b7dd5286de6ac22ba8ef0569e12c96e2725889e0546107e919" },
+    { "path": "patches/dosbox-x/series/0010-feat-debugger-observe-DOS-file-services.patch", "sha256": "25f2faf86b850e54567405b978e65a8846753a94a6a300146b27eb223b21fd0f" },
+    { "path": "patches/dosbox-x/series/0011-feat-debugger-add-deterministic-replay-checkpoints.patch", "sha256": "eb905eb4d50f05121487c6f141500c8bf02aecfb0323d1ea9354fd6ccf75e286" },
+    { "path": "patches/dosbox-x/series/0012-feat-debugger-trace-Win16-API-entrypoints.patch", "sha256": "18353815afedfa358dece95e4e4d589748f3339f96b0e4ed703aadfcad2f1887" },
+    { "path": "patches/dosbox-x/series/0013-feat-debugger-replay-input-at-instruction-boundaries.patch", "sha256": "ca659fc656164e7bb7bd995e62ef7b256f4a00b39490b707cb4ea91bde53447c" },
+    { "path": "patches/dosbox-x/series/0014-feat-debugger-capture-bounded-code-coverage.patch", "sha256": "28e56b019019e70be2474c79c91175d879a8e81bf1a37d20073277dd31014e29" },
+    { "path": "patches/dosbox-x/series/0015-feat-debugger-capture-stopped-render-snapshots.patch", "sha256": "4dd043398f668a9556e82d62051ab0c5f1c9b25261e2df60af4c6ec1a38e2b40" },
+    { "path": "patches/dosbox-x/series/0016-feat-debugger-correlate-DOS-file-services-with-guest.patch", "sha256": "5dc80d0e91b3388372b72a9c3b6e36326c757457f1506637e81ce06343cdd188" },
+    { "path": "patches/dosbox-x/series/0017-feat-debugger-verify-deterministic-replay-dependenci.patch", "sha256": "80e7b48c358a98daa3fddfd6326eedd06402bf1d04e6ad5c429320bfee8d12f9" },
+    { "path": "patches/dosbox-x/series/0018-feat-debugger-defer-logical-NE-API-probes.patch", "sha256": "d7b4ad642c8a2df1471cc157e41580549de1492d32adb413a273928d9c2cddb1" },
+    { "path": "patches/dosbox-x/series/0019-feat-debugger-match-logical-NE-image-bounds.patch", "sha256": "90a77bde0fdc5a620de27504922f150e3984c72a6bbeb443a37fc37137777f42" }
+  ]
+}

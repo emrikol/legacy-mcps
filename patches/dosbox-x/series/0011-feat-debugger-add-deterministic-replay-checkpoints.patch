@@ -1,0 +1,423 @@
+From b03d44b21cb4496bcaa26c3eb0825cd671bc5406 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 20:23:18 -0400
+Subject: [PATCH 11/19] feat(debugger): add deterministic replay checkpoints
+
+---
+ include/debug.h                   |   3 +
+ include/tool_build_identity.h     |   2 +-
+ src/cpu/core_normal.cpp           |   5 +-
+ src/debug/debug.cpp               | 294 +++++++++++++++++++++++++++++-
+ src/gui/dosbox_control_server.cpp |   2 +-
+ 5 files changed, 300 insertions(+), 6 deletions(-)
+
+diff --git a/include/debug.h b/include/debug.h
+index 1b1bac7..4a4401c 100644
+--- a/include/debug.h
++++ b/include/debug.h
+@@ -69,4 +69,7 @@ extern Bitu debugCallback;
+ bool DEBUG_HeavyIsBreakpoint(void);
+ bool DEBUG_ExceptionBreakpoint(Bitu which, Bitu error);
+ void DEBUG_HeavyWriteLogInstruction(void);
++/* Counts instructions executed by the normal core while deterministic replay
++ * tracking is active. Replay mode deliberately forces the normal core. */
++void DEBUG_RemoteInstructionRetired(void);
+ #endif
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+index 7cc615b..0005f6f 100644
+--- a/include/tool_build_identity.h
++++ b/include/tool_build_identity.h
+@@ -1,2 +1,2 @@
+ /* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
+-#define DOSBOX_X_BUILD_ID "3695287d34edcb0ad27267c7630f719cfc32243744cb9b40609f675252e37c54"
++#define DOSBOX_X_BUILD_ID "2f3ebedaf395229082821cfeb1d0214a1c4409a1876c4822fdf75458b46f9142"
+diff --git a/src/cpu/core_normal.cpp b/src/cpu/core_normal.cpp
+index 3d4e601..007bda6 100644
+--- a/src/cpu/core_normal.cpp
++++ b/src/cpu/core_normal.cpp
+@@ -180,6 +180,9 @@ Bits CPU_Core_Normal_Run(void) {
+ #endif
+ #endif
+ 		cycle_count++;
++#if C_DEBUG && C_HEAVY_DEBUG
++		DEBUG_RemoteInstructionRetired();
++#endif
+ restart_opcode:
+ 		switch (core.opcode_index+Fetchb()) {
+ 		#include "core_normal/prefix_none.h"
+@@ -214,7 +217,7 @@ restart_opcode:
+ 		}
+ 		SAVEIP;
+ 	}
+-    FillFlags();
++	FillFlags();
+     return CBRET_NONE;
+ decode_end:
+ 	SAVEIP;
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index cfb8076..b07d071 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -57,6 +57,7 @@ using namespace std;
+ #include "../cpu/lazyflags.h"
+ #include "keyboard.h"
+ #include "control.h"
++#include "unzip.h"
+ 
+ bool Clear_SYSENTER_Debug();
+ bool Toggle_BreakSYSEnter();
+@@ -372,6 +373,64 @@ static bool remote_debug_response_ready = false;
+ static bool remote_oracle_manipulated = false;
+ static unsigned int remote_mutation_count = 0;
+ 
++/* Deterministic replay foundation. A named checkpoint request is parsed while
++ * stopped, then executed by RemoteDebuggerLoop after the parser returns. This
++ * keeps SaveState load/save outside the command dispatcher and on the emulator
++ * thread, matching the mapper's supported save-state execution context. */
++static bool remote_replay_active = false;
++static uint64_t remote_replay_sequence = 0;
++static bool remote_replay_save_component_written = false;
++static bool remote_replay_load_component_seen = false;
++enum RemoteCheckpointAction {
++	REMOTE_CHECKPOINT_NONE,
++	REMOTE_CHECKPOINT_SAVE,
++	REMOTE_CHECKPOINT_RESTORE
++};
++static RemoteCheckpointAction remote_checkpoint_action = REMOTE_CHECKPOINT_NONE;
++static std::string remote_checkpoint_name;
++
++class RemoteReplaySaveState : public SaveState::Component {
++public:
++	RemoteReplaySaveState()
++	{
++		SaveState::instance().registerComponent("Remote_Replay", *this);
++	}
++
++	void getBytes(std::ostream &stream) override
++	{
++		const uint32_t magic = UINT32_C(0x52525031); /* "RRP1" */
++		writePOD(stream, magic);
++		writePOD(stream, remote_replay_active);
++		writePOD(stream, remote_replay_sequence);
++		remote_replay_save_component_written = stream.good();
++	}
++
++	void setBytes(std::istream &stream) override
++	{
++		uint32_t magic = 0;
++		bool active = false;
++		uint64_t sequence = 0;
++		readPOD(stream, magic);
++		readPOD(stream, active);
++		readPOD(stream, sequence);
++		if (!stream.good() || magic != UINT32_C(0x52525031)) return;
++		remote_replay_active = active;
++		remote_replay_sequence = sequence;
++		remote_replay_load_component_seen = true;
++	}
++};
++
++static RemoteReplaySaveState &RemoteReplayStateComponent()
++{
++	static RemoteReplaySaveState component;
++	return component;
++}
++
++void DEBUG_RemoteInstructionRetired(void)
++{
++	if (remote_replay_active) ++remote_replay_sequence;
++}
++
+ struct RemoteFileIoEvent {
+ 	uint64_t sequence;
+ 	DEBUG_FileIoOperation operation;
+@@ -4944,6 +5003,7 @@ static std::string RemoteRegisterState(void)
+ 	    << " CORE=" << (CPU_IsDynamicCore() ? "DYNAMIC" : "NORMAL")
+ 	    << " ORACLE=" << (remote_oracle_manipulated ? "MANIPULATED" : "PRISTINE")
+ 	    << " MUTATIONS=" << std::dec << remote_mutation_count << std::hex
++	    << " SEQUENCE=" << std::dec << remote_replay_sequence << std::hex
+ 	    << " EAX=" << std::setw(8) << reg_eax
+ 	    << " EBX=" << std::setw(8) << reg_ebx
+ 	    << " ECX=" << std::setw(8) << reg_ecx
+@@ -5356,6 +5416,196 @@ static void RemoteStepOneInstruction(bool inhibit_events = false)
+ 	cpudecoder = configured_decoder;
+ }
+ 
++static bool RemoteCheckpointNameIsValid(const std::string &name)
++{
++	if (name.empty() || name.size() > 32U ||
++	    !isalnum(static_cast<unsigned char>(name[0])) ||
++	    name.find("..") != std::string::npos) return false;
++	for (const auto ch : name) {
++		if (!isalnum(static_cast<unsigned char>(ch)) && ch != '-' &&
++		    ch != '_' && ch != '.') return false;
++	}
++	return true;
++}
++
++static std::string RemoteCheckpointPath(const std::string &name)
++{
++	extern std::string capturedir;
++	std::string directory;
++	bool Get_Custom_SaveDir(std::string &savedir);
++	if (!Get_Custom_SaveDir(directory)) {
++		const size_t slash = capturedir.find_last_of("\\/");
++		directory = slash == std::string::npos ? "." : capturedir.substr(0, slash);
++		directory += CROSS_FILESPLIT;
++		directory += "save";
++	}
++	Cross::CreateDir(directory);
++	directory += CROSS_FILESPLIT;
++	directory += "remote-replay";
++	Cross::CreateDir(directory);
++	return directory + CROSS_FILESPLIT + name + ".sav";
++}
++
++static bool RemoteCheckpointFileExists(const std::string &path)
++{
++	std::ifstream input(path.c_str(), std::ifstream::in | std::ifstream::binary);
++	if (!input.good()) return false;
++	input.seekg(0, std::ifstream::end);
++	return input.good() && input.tellg() > 0;
++}
++
++static bool RemoteCheckpointRemoveExisting(const std::string &path)
++{
++	/* SaveState has early returns before its own remove(). Proactively remove a
++	 * stale archive and prove the directory entry is gone before saving. */
++	(void)remove(path.c_str());
++	std::ifstream input(path.c_str(), std::ifstream::in | std::ifstream::binary);
++	return !input.good();
++}
++
++static bool RemoteCheckpointArchiveMatches(const std::string &path,
++                                            uint64_t expected_sequence)
++{
++	unzFile archive = unzOpen64(path.c_str());
++	if (archive == NULL) return false;
++
++	bool matches = false;
++	if (unzLocateFile(archive, "Remote_Replay", 1) == UNZ_OK &&
++	    unzOpenCurrentFile(archive) == UNZ_OK) {
++		uint32_t magic = 0;
++		bool active = false;
++		uint64_t sequence = 0;
++		const int magic_bytes = unzReadCurrentFile(archive, &magic, sizeof(magic));
++		const int active_bytes = unzReadCurrentFile(archive, &active, sizeof(active));
++		const int sequence_bytes =
++		        unzReadCurrentFile(archive, &sequence, sizeof(sequence));
++		uint8_t extra = 0;
++		const int extra_bytes = unzReadCurrentFile(archive, &extra, sizeof(extra));
++		const int member_close = unzCloseCurrentFile(archive);
++		matches = magic_bytes == static_cast<int>(sizeof(magic)) &&
++		          active_bytes == static_cast<int>(sizeof(active)) &&
++		          sequence_bytes == static_cast<int>(sizeof(sequence)) &&
++		          extra_bytes == 0 && member_close == UNZ_OK &&
++		          magic == UINT32_C(0x52525031) && active &&
++		          sequence == expected_sequence;
++	}
++	return unzClose(archive) == UNZ_OK && matches;
++}
++
++static std::string RemotePerformCheckpointAction()
++{
++	const RemoteCheckpointAction action = remote_checkpoint_action;
++	const std::string name = remote_checkpoint_name;
++	remote_checkpoint_action = REMOTE_CHECKPOINT_NONE;
++	remote_checkpoint_name.clear();
++	if (action == REMOTE_CHECKPOINT_NONE) return "ERR NO_CHECKPOINT_ACTION";
++
++	(void)RemoteReplayStateComponent();
++	const std::string path = RemoteCheckpointPath(name);
++	extern bool use_save_file, noremark_save_state, force_load_state;
++	extern std::string savefilename;
++	const bool old_use_save_file = use_save_file;
++	const bool old_noremark = noremark_save_state;
++	const bool old_force_load = force_load_state;
++	const std::string old_savefilename = savefilename;
++	use_save_file = true;
++	noremark_save_state = true;
++	force_load_state = false;
++	savefilename = path;
++
++	std::string result;
++	if (action == REMOTE_CHECKPOINT_SAVE) {
++		const bool old_replay_active = remote_replay_active;
++		remote_replay_save_component_written = false;
++		if (!RemoteCheckpointRemoveExisting(path)) {
++			result = "ERR CHECKPOINT_STALE_REMOVE_FAILED";
++		} else {
++			remote_replay_active = true;
++			SaveState::instance().save(0);
++			if (remote_replay_save_component_written &&
++			    RemoteCheckpointArchiveMatches(path, remote_replay_sequence))
++				result = "OK CHECKPOINT=SAVED NAME=" + name +
++				         " SEQUENCE=" + std::to_string(remote_replay_sequence);
++			else if (!RemoteCheckpointRemoveExisting(path))
++				result = "ERR CHECKPOINT_SAVE_FAILED_CLEANUP_FAILED";
++			else
++				result = "ERR CHECKPOINT_SAVE_FAILED";
++		}
++		if (result.compare(0, 3, "ERR") == 0)
++			remote_replay_active = old_replay_active;
++	} else if (!RemoteCheckpointFileExists(path)) {
++		result = "ERR CHECKPOINT_NOT_FOUND";
++	} else {
++		remote_replay_load_component_seen = false;
++		SaveState::instance().load(0);
++		if (!remote_replay_load_component_seen) {
++			/* DOSBox-X's load API cannot roll back a partially read archive. Keep the
++			 * debugger stopped and make the uncertain state explicit. */
++			result = "ERR CHECKPOINT_RESTORE_FAILED STATE_UNCERTAIN_STOPPED=1";
++		} else {
++			remote_replay_active = true;
++			result = "OK CHECKPOINT=RESTORED NAME=" + name +
++			         " SEQUENCE=" + std::to_string(remote_replay_sequence);
++		}
++	}
++
++	use_save_file = old_use_save_file;
++	noremark_save_state = old_noremark;
++	force_load_state = old_force_load;
++	savefilename = old_savefilename;
++	return result;
++}
++
++static void RemoteHashByte(uint64_t &hash, uint8_t value)
++{
++	hash ^= value;
++	hash *= UINT64_C(1099511628211);
++}
++
++static void RemoteHashValue(uint64_t &hash, uint64_t value,
++	                        unsigned int byte_count)
++{
++	for (unsigned int byte = 0; byte < byte_count; ++byte)
++		RemoteHashByte(hash, static_cast<uint8_t>(value >> (byte * 8U)));
++}
++
++static std::string RemoteGuestStateHash(uint16_t selector, uint32_t offset,
++	                                    uint32_t count)
++{
++	if (!count || count > 0x10000U || offset > 0xffffffffU - (count - 1U))
++		return "ERR HASH_COUNT_RANGE_1_10000";
++	const uint64_t first = GetAddress(selector, offset);
++	const uint64_t last = GetAddress(selector, offset + count - 1U);
++	if (first == mem_no_address || last == mem_no_address ||
++	    last != first + count - 1U || last > 0xffffffffU)
++		return "ERR INVALID_ADDRESS";
++
++	FillFlags();
++	uint64_t hash = UINT64_C(14695981039346656037);
++	RemoteHashValue(hash, reg_eax, 4); RemoteHashValue(hash, reg_ebx, 4);
++	RemoteHashValue(hash, reg_ecx, 4); RemoteHashValue(hash, reg_edx, 4);
++	RemoteHashValue(hash, reg_esi, 4); RemoteHashValue(hash, reg_edi, 4);
++	RemoteHashValue(hash, reg_ebp, 4); RemoteHashValue(hash, reg_esp, 4);
++	RemoteHashValue(hash, reg_eip, 4); RemoteHashValue(hash, reg_flags, 4);
++	RemoteHashValue(hash, SegValue(cs), 2); RemoteHashValue(hash, SegValue(ss), 2);
++	RemoteHashValue(hash, SegValue(ds), 2); RemoteHashValue(hash, SegValue(es), 2);
++	RemoteHashValue(hash, SegValue(fs), 2); RemoteHashValue(hash, SegValue(gs), 2);
++	for (uint32_t index = 0; index < count; ++index) {
++		uint8_t value = 0;
++		if (mem_readb_checked(static_cast<PhysPt>(first + index), &value))
++			return "ERR MEMORY_READ";
++		RemoteHashByte(hash, value);
++	}
++
++	std::ostringstream out;
++	out << "OK HASH=FNV1A64:" << std::hex << std::uppercase << std::setfill('0')
++	    << std::setw(16) << hash << " SEQUENCE=" << std::dec
++	    << remote_replay_sequence << " ADDRESS=" << std::hex << std::setw(4)
++	    << selector << ":" << std::setw(8) << offset << " COUNT="
++	    << std::setw(8) << count;
++	return out.str();
++}
++
+ static std::string RemoteExecuteCommand(const std::string &request,
+                                         bool &resume);
+ 
+@@ -5366,7 +5616,8 @@ static bool RemoteBatchCommandCanResume(const std::string &request)
+ 	input >> command;
+ 	for (auto &ch : command) ch = static_cast<char>(toupper(ch));
+ 	return command == "CONTINUE" || command == "NEXT" || command == "RUN" ||
+-	       command == "PAUSE" || command == "WAIT" || command == "STATUS";
++	       command == "PAUSE" || command == "WAIT" || command == "STATUS" ||
++	       command == "CHECKPOINT";
+ }
+ 
+ static std::string RemoteBatchResponse(const std::vector<std::string> &responses,
+@@ -5472,6 +5723,34 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		return RemoteExecuteBatch(request.substr(separator + 1));
+ 	}
+ 
++	if (command == "CHECKPOINT") {
++		std::string action, name, extra;
++		input >> action >> name >> extra;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if ((action != "SAVE" && action != "RESTORE") || !extra.empty())
++			return "ERR USAGE DEBUG CHECKPOINT <SAVE|RESTORE> <name>";
++		if (!RemoteCheckpointNameIsValid(name))
++			return "ERR CHECKPOINT_NAME_1_32_SAFE_ASCII";
++		if (remote_checkpoint_action != REMOTE_CHECKPOINT_NONE)
++			return "ERR CHECKPOINT_BUSY";
++		remote_checkpoint_name = name;
++		remote_checkpoint_action = action == "SAVE" ? REMOTE_CHECKPOINT_SAVE :
++		                                                 REMOTE_CHECKPOINT_RESTORE;
++		return "OK CHECKPOINT=QUEUED";
++	}
++
++	if (command == "HASH") {
++		std::string address_text, count_text, extra;
++		input >> address_text >> count_text >> extra;
++		uint16_t selector = 0;
++		uint32_t offset = 0;
++		uint32_t count = 0;
++		if (!extra.empty() || !RemoteParseAddress(address_text, selector, offset) ||
++		    !RemoteParseHex(count_text, count))
++			return "ERR USAGE DEBUG HASH <selector:offset> <hex-count>";
++		return RemoteGuestStateHash(selector, offset, count);
++	}
++
+ 	if (command == "REGISTERS") return RemoteRegisterState();
+ 
+ 	if (command == "FILEIO") {
+@@ -6010,7 +6289,15 @@ static Bitu RemoteDebuggerLoop(void)
+ 		}
+ 
+ 		bool resume = false;
+-		const std::string response = RemoteExecuteCommand(request, resume);
++		std::string response = RemoteExecuteCommand(request, resume);
++		if (remote_checkpoint_action != REMOTE_CHECKPOINT_NONE) {
++			response = RemotePerformCheckpointAction();
++			/* Replay sequencing uses one-instruction normal-core boundaries under
++			 * normal-core replay sequencing; dynamic blocks cannot expose every retirement. */
++			cpudecoder = &CPU_Core_Normal_Run;
++			remote_debug_stopped.store(true);
++			remote_debug_stop_reason.store(REMOTE_STOP_PAUSE);
++		}
+ 		{
+ 			std::lock_guard<std::mutex> lock(remote_debug_mutex);
+ 			remote_debug_response = response;
+@@ -6040,7 +6327,8 @@ bool DEBUG_RemoteCommand(const char *command, char *response,
+ 		                        RemoteRegisterState() :
+ 		                        std::string("OK STOPPED=0 REASON=RUNNING ORACLE=") +
+ 		                        (remote_oracle_manipulated ? "MANIPULATED" : "PRISTINE") +
+-		                        " MUTATIONS=" + std::to_string(remote_mutation_count);
++		                        " MUTATIONS=" + std::to_string(remote_mutation_count) +
++		                        " SEQUENCE=" + std::to_string(remote_replay_sequence);
+ 	} else if (verb == "PAUSE") {
+ 		remote_debug_enabled.store(true);
+ 		if (!remote_debug_stopped.load()) {
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index 808e886..1e63ce6 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -142,7 +142,7 @@ static std::string handle_command(const std::string& cmd) {
+                DOSBOX_X_BUILD_ID
+                " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
+ #if C_DEBUG
+-               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,WAIT,CONTINUE"
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,CHECKPOINT,HASH,WAIT,CONTINUE"
+ #else
+                " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
+ #endif

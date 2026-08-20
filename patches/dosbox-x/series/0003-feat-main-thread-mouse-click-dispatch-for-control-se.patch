@@ -1,0 +1,199 @@
+From 5321c6fe357062a763a02b850328a7f504e12fbc Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 28 Mar 2026 00:26:42 -0400
+Subject: [PATCH 03/19] feat: main-thread mouse click dispatch for control
+ server
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+CLICK x y now dispatches SDL events from the main thread via
+GFX_Events hook (before poll skip check). The click_requested
+atomic flag is set by the control thread and checked by the
+main loop.
+
+Note: clicks dispatch correctly (OK returned) but SDL mouse
+events don't translate to Windows mouse messages in DOSBox-X.
+The SDL event injection bypasses DOSBox-X's own input pipeline.
+Needs further investigation — may need to use the int33 mouse
+driver interface instead of SDL events.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/gui/Makefile.am               |  3 +-
+ src/gui/dosbox_control_server.cpp | 86 +++++++++++++++++++------------
+ src/gui/sdlmain.cpp               | 19 ++++++-
+ 3 files changed, 74 insertions(+), 34 deletions(-)
+
+diff --git a/src/gui/Makefile.am b/src/gui/Makefile.am
+index 4e16f71..730c77c 100644
+--- a/src/gui/Makefile.am
++++ b/src/gui/Makefile.am
+@@ -10,7 +10,8 @@ libgui_a_SOURCES = \
+ 	render_templates_hq2x.h render_templates_hq3x.h \
+ 	midi.cpp midi_win32.h midi_oss.h midi_coreaudio.h \
+ 	midi_alsa.h midi_coremidi.h sdl_gui.cpp dosbox_splash.h \
+-	menu.cpp menu_callback.cpp bitop.cpp ptrop.cpp zipcrc.c zipfile.cpp
++	menu.cpp menu_callback.cpp bitop.cpp ptrop.cpp zipcrc.c zipfile.cpp \
++	dosbox_control_server.cpp
+ 
+ if C_MT32
+ AM_CPPFLAGS += -I$(top_srcdir)/src/libs/mt32
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index 6b91120..db123b6 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -55,6 +55,11 @@ static std::string screenshot_path;
+ static std::atomic<bool> screenshot_requested(false);
+ static std::atomic<bool> screenshot_done(false);
+ 
++/* Mouse click request (dispatched on main thread via GFX_Events) */
++static std::atomic<bool> click_requested(false);
++static std::atomic<bool> click_done(false);
++static int click_x = 0, click_y = 0;
++
+ /* Public interface for hardware.cpp to check */
+ bool ControlServer_ScreenshotRequested() {
+     return screenshot_requested.load();
+@@ -69,6 +74,43 @@ void ControlServer_ScreenshotComplete() {
+     screenshot_requested.store(false);
+ }
+ 
++/* Public: called from main event loop (GFX_Events or similar) to dispatch clicks */
++bool ControlServer_ClickRequested() {
++    return click_requested.load();
++}
++
++void ControlServer_DispatchClick() {
++    if (!click_requested.load()) return;
++    /* Push SDL events on the main thread where they'll be processed */
++    SDL_Event ev;
++    memset(&ev, 0, sizeof(ev));
++    ev.type = SDL_MOUSEMOTION;
++    ev.motion.x = click_x;
++    ev.motion.y = click_y;
++    SDL_PushEvent(&ev);
++
++    memset(&ev, 0, sizeof(ev));
++    ev.type = SDL_MOUSEBUTTONDOWN;
++    ev.button.button = SDL_BUTTON_LEFT;
++    ev.button.state = SDL_PRESSED;
++    ev.button.x = click_x;
++    ev.button.y = click_y;
++    SDL_PushEvent(&ev);
++
++    SDL_Delay(80);
++
++    memset(&ev, 0, sizeof(ev));
++    ev.type = SDL_MOUSEBUTTONUP;
++    ev.button.button = SDL_BUTTON_LEFT;
++    ev.button.state = SDL_RELEASED;
++    ev.button.x = click_x;
++    ev.button.y = click_y;
++    SDL_PushEvent(&ev);
++
++    click_requested.store(false);
++    click_done.store(true);
++}
++
+ static std::string handle_command(const std::string& cmd) {
+     /* Trim trailing whitespace */
+     std::string c = cmd;
+@@ -308,41 +350,21 @@ static std::string handle_command(const std::string& cmd) {
+     if (c.substr(0, 5) == "CLICK" && c.length() > 6) {
+         /*
+          * CLICK <x> <y> — move mouse to (x,y) and click left button.
+-         * Coordinates are in emulated screen pixels (e.g., 1024x768).
+-         * Uses SDL events to inject mouse motion + click into the event queue.
++         * Coordinates are SDL window pixels (matching the DOSBox-X window).
++         * Click is dispatched on main thread via ControlServer_DispatchClick().
+          */
+         int cx = 0, cy = 0;
+         if (sscanf(c.c_str() + 6, "%d %d", &cx, &cy) == 2) {
+-            SDL_Event ev;
+-            memset(&ev, 0, sizeof(ev));
+-
+-            /* Mouse motion to position */
+-            ev.type = SDL_MOUSEMOTION;
+-            ev.motion.x = cx;
+-            ev.motion.y = cy;
+-            ev.motion.state = 0;
+-            SDL_PushEvent(&ev);
+-            usleep(30000);
+-
+-            /* Mouse button down */
+-            memset(&ev, 0, sizeof(ev));
+-            ev.type = SDL_MOUSEBUTTONDOWN;
+-            ev.button.button = SDL_BUTTON_LEFT;
+-            ev.button.state = SDL_PRESSED;
+-            ev.button.x = cx;
+-            ev.button.y = cy;
+-            SDL_PushEvent(&ev);
+-            usleep(80000);
+-
+-            /* Mouse button up */
+-            memset(&ev, 0, sizeof(ev));
+-            ev.type = SDL_MOUSEBUTTONUP;
+-            ev.button.button = SDL_BUTTON_LEFT;
+-            ev.button.state = SDL_RELEASED;
+-            ev.button.x = cx;
+-            ev.button.y = cy;
+-            SDL_PushEvent(&ev);
+-            return "OK\n";
++            click_x = cx;
++            click_y = cy;
++            click_done.store(false);
++            click_requested.store(true);
++
++            /* Wait for main thread to dispatch (max 2 seconds) */
++            for (int i = 0; i < 20 && !click_done.load(); i++) {
++                usleep(100000);
++            }
++            return click_done.load() ? "OK\n" : "ERR TIMEOUT\n";
+         }
+         return "ERR CLICK_FORMAT\n";
+     }
+diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
+index 77f4f32..5c2a901 100644
+--- a/src/gui/sdlmain.cpp
++++ b/src/gui/sdlmain.cpp
+@@ -4128,7 +4128,7 @@ static void GUI_StartUp() {
+     {
+ #if C_DIRECT3D
+         if(!init_output) OUTPUT_DIRECT3D_Select();
+-#elif C_OPENGL && defined(MACOSX) // JC: This is breaking SDL1 on Linux! Limit this to MAC OS! Windows users may use this if needed.
++#elif C_OPENGL && defined(MACOSX) && !defined(__arm64__) // JC: This is breaking SDL1 on Linux! Limit this to MAC OS! Windows users may use this if needed.
+         if(!init_output) OUTPUT_OPENGL_Select(GLBilinear); // Initialize screen before switching to TTF (required for macOS builds)
+ #endif
+         OUTPUT_SURFACE_Select();
+@@ -5873,6 +5873,14 @@ bool gfx_in_mapper = false;
+ #endif
+ 
+ void GFX_Events() {
++    /* Dispatch any pending control server mouse clicks on the main thread
++     * (before poll skip check so clicks aren't rate-limited) */
++    {
++        extern bool ControlServer_ClickRequested();
++        extern void ControlServer_DispatchClick();
++        if (ControlServer_ClickRequested()) ControlServer_DispatchClick();
++    }
++
+     CheckMapperKeyboardLayout();
+ #if defined(C_SDL2) /* SDL 2.x---------------------------------- */
+     //Don't poll too often. This can be heavy on the OS, especially Macs.
+@@ -8459,6 +8467,15 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
+     bitop::self_test();
+     ptrop::self_test();
+ 
++    // Initialize control server for external automation
++    {
++        extern void ControlServer_Init(int port);
++        extern void ControlServer_Shutdown();
++        const char *port_env = getenv("DOSBOX_CONTROL_PORT");
++        int port = port_env ? atoi(port_env) : 0;
++        if (port > 0) ControlServer_Init(port);
++    }
++
+     // initialize output libraries
+     OUTPUT_SURFACE_Initialize();
+ #if C_OPENGL

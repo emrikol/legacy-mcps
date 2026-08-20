@@ -1,0 +1,350 @@
+From 10f5c61950be2f6b85b68b655183fcd8b6a0d437 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 21:40:30 -0400
+Subject: [PATCH 15/19] feat(debugger): capture stopped render snapshots
+
+---
+ include/render.h                  |   3 +
+ include/tool_build_identity.h     |   2 +-
+ src/debug/debug.cpp               |  10 ++
+ src/gui/dosbox_control_server.cpp |   2 +-
+ src/gui/render.cpp                | 241 ++++++++++++++++++++++++++++++
+ 5 files changed, 256 insertions(+), 2 deletions(-)
+
+diff --git a/include/render.h b/include/render.h
+index 5ccd1b4..faa8a1a 100644
+--- a/include/render.h
++++ b/include/render.h
+@@ -19,6 +19,8 @@
+ #ifndef DOSBOX_RENDER_H
+ #define DOSBOX_RENDER_H
+ 
++#include <string>
++
+ // 0: complex scalers off, scaler cache off, some simple scalers off, memory requirements reduced
+ // 1: complex scalers off, scaler cache off, all simple scalers on
+ // 2: complex scalers off, scaler cache on
+@@ -196,5 +198,6 @@ bool TempLineAlloc(unsigned int w);
+ void TempLineFree(void);
+ void scalerSourceCacheBufferFree(void);
+ bool scalerSourceCacheBufferAlloc(unsigned int p,unsigned int h);
++std::string RENDER_SaveStoppedSnapshot(const std::string &name);
+ 
+ #endif
+diff --git a/include/tool_build_identity.h b/include/tool_build_identity.h
+index aae2074..1978e40 100644
+--- a/include/tool_build_identity.h
++++ b/include/tool_build_identity.h
+@@ -1,2 +1,2 @@
+ /* Reproducible identity for this reviewed DOSBox-X MCP source revision. */
+-#define DOSBOX_X_BUILD_ID "f0dcadd49070f931f2a09c25d3e192cc71d810888480c07f4a5845a3ed90e076"
++#define DOSBOX_X_BUILD_ID "9e046d7a5154a4a823586edc7a5854beea25f7032d5c6f58ad2fb9c1e1496d94"
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index a33d2c5..7390528 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -45,6 +45,7 @@ using namespace std;
+ #include "bios.h"
+ #include "timer.h"
+ #include "video.h"
++#include "render.h"
+ #include "vga.h"
+ #include "mmx.h"
+ #include "mapper.h"
+@@ -6654,6 +6655,15 @@ static std::string RemoteExecuteCommand(const std::string &request,
+ 		return RemoteWin16Stack(count);
+ 	}
+ 
++	if (command == "SNAPSHOT") {
++		std::string name, extra;
++		input >> name >> extra;
++		if (!extra.empty()) return "ERR USAGE DEBUG SNAPSHOT <safe-name.png>";
++		return RENDER_SaveStoppedSnapshot(name) +
++		       " SEQUENCE=" + std::to_string(remote_replay_sequence) +
++		       " REPLAY_ACTIVE=" + (remote_replay_active ? "1" : "0");
++	}
++
+ 	if (command == "INTERRUPT") {
+ 		std::string action, vector_text, ah_text, al_text, option, extra;
+ 		input >> action >> vector_text >> ah_text >> al_text >> option >> extra;
+diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
+index 5e370a4..cab5687 100644
+--- a/src/gui/dosbox_control_server.cpp
++++ b/src/gui/dosbox_control_server.cpp
+@@ -142,7 +142,7 @@ static std::string handle_command(const std::string& cmd) {
+                DOSBOX_X_BUILD_ID
+                " FEATURES=PING,IDENTITY,STATUS,MINIMIZE,DEBUG,SCREENSHOT,SCREEN,TYPE,KEY,CLICK,QUIT"
+ #if C_DEBUG
+-               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,CHECKPOINT,HASH,INPUT,WAIT,CONTINUE"
++               " DEBUG_PROTOCOL=1 DEBUG_FEATURES=STATUS,PAUSE,REGISTERS,SELECTOR,MEMORY,DISASM,STACK,SNAPSHOT,STEP,NEXT,FINISH,RUN,BREAK,WATCH,INTERRUPT,EXCEPTION,BATCH,MUTATE,FILEIO,APITRACE,COVERAGE,CHECKPOINT,HASH,INPUT,WAIT,CONTINUE"
+ #else
+                " DEBUG_PROTOCOL=NONE DEBUG_FEATURES=NONE"
+ #endif
+diff --git a/src/gui/render.cpp b/src/gui/render.cpp
+index a16561e..49c0e9e 100644
+--- a/src/gui/render.cpp
++++ b/src/gui/render.cpp
+@@ -22,8 +22,23 @@
+ #include <math.h>
+ #include <fstream>
+ #include <sstream>
++#include <cerrno>
++#include <cctype>
++#include <cstdio>
++#include <cstdlib>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <utility>
++#if defined(WIN32)
++#include <io.h>
++#else
++#include <unistd.h>
++#endif
+ 
+ #include "dosbox.h"
++#if C_SSHOT
++#include <png.h>
++#endif
+ #include "logging.h"
+ #include "video.h"
+ #include "render.h"
+@@ -57,6 +72,231 @@ bool useTraditionalRenderCache = false;
+ 
+ unsigned char *scalerSourceCacheBuffer=NULL;
+ unsigned int scalerSourceCacheBufferSize=0;
++extern std::string capturedir;
++static uint64_t stopped_snapshot_frame_generation = 0;
++static uint8_t *stopped_snapshot_source = NULL;
++static size_t stopped_snapshot_source_size = 0;
++static uint8_t *stopped_snapshot_staging = NULL;
++static size_t stopped_snapshot_staging_size = 0;
++static Bitu stopped_snapshot_width = 0;
++static Bitu stopped_snapshot_height = 0;
++static Bitu stopped_snapshot_pitch = 0;
++static Bitu stopped_snapshot_source_bpp = 0;
++static RenderPal_t stopped_snapshot_palette = {};
++static bool stopped_snapshot_cache_allocation_failed = false;
++
++static bool RENDER_IsSafeSnapshotName(const std::string &name)
++{
++	if (name.size() < 5 || name.size() > 36 || name.find("..") != std::string::npos ||
++	    name.compare(name.size() - 4, 4, ".png") != 0 ||
++	    !isalnum(static_cast<unsigned char>(name[0]))) return false;
++	for (const auto character : name) {
++		if (!isalnum(static_cast<unsigned char>(character)) && character != '-' &&
++		    character != '_' && character != '.') return false;
++	}
++	return true;
++}
++
++static bool RENDER_CopySourceAsRgb(uint8_t *rgb, const uint8_t *source_frame,
++	                               const Bitu source_pitch,
++	                               const RenderPal_t &source_palette,
++	                               const Bitu width, const Bitu height,
++	                               const Bitu source_bpp)
++{
++	uint8_t red_offset = 0;
++	uint8_t green_offset = 1;
++	uint8_t blue_offset = 2;
++	if (source_bpp == 32) {
++		const uint32_t red = static_cast<uint32_t>(GFX_GetRGB(0xff, 0, 0));
++		const uint32_t green = static_cast<uint32_t>(GFX_GetRGB(0, 0xff, 0));
++		const uint32_t blue = static_cast<uint32_t>(GFX_GetRGB(0, 0, 0xff));
++		for (uint8_t offset = 0; offset < 4; ++offset) {
++			if ((red >> (offset * 8U) & 0xffU) == 0xffU) red_offset = offset;
++			if ((green >> (offset * 8U) & 0xffU) == 0xffU) green_offset = offset;
++			if ((blue >> (offset * 8U) & 0xffU) == 0xffU) blue_offset = offset;
++		}
++	}
++	for (Bitu y = 0; y < height; ++y) {
++		const uint8_t *source = source_frame + y * source_pitch;
++		uint8_t *destination = rgb + y * width * 3U;
++		for (Bitu x = 0; x < width; ++x) {
++			if (source_bpp == 8) {
++				const auto &color = source_palette.rgb[source[x]];
++				destination[x * 3U] = color.red;
++				destination[x * 3U + 1U] = color.green;
++				destination[x * 3U + 2U] = color.blue;
++			} else if (source_bpp == 15) {
++				const uint16_t pixel = reinterpret_cast<const uint16_t *>(source)[x];
++				/* Match CAPTURE_AddImage's source-pixel channel ordering exactly. */
++				destination[x * 3U] = static_cast<uint8_t>(((pixel & 0x001fU) * 0x21U) >> 2U);
++				destination[x * 3U + 1U] = static_cast<uint8_t>(((pixel & 0x03e0U) * 0x21U) >> 7U);
++				destination[x * 3U + 2U] = static_cast<uint8_t>(((pixel & 0x7c00U) * 0x21U) >> 12U);
++			} else if (source_bpp == 16) {
++				const uint16_t pixel = reinterpret_cast<const uint16_t *>(source)[x];
++				destination[x * 3U] = static_cast<uint8_t>(((pixel & 0x001fU) * 0x21U) >> 2U);
++				destination[x * 3U + 1U] = static_cast<uint8_t>(((pixel & 0x07e0U) * 0x41U) >> 9U);
++				destination[x * 3U + 2U] = static_cast<uint8_t>(((pixel & 0xf800U) * 0x21U) >> 13U);
++			} else if (source_bpp == 32) {
++				destination[x * 3U] = source[x * 4U + red_offset];
++				destination[x * 3U + 1U] = source[x * 4U + green_offset];
++				destination[x * 3U + 2U] = source[x * 4U + blue_offset];
++			} else {
++				return false;
++			}
++		}
++	}
++	return true;
++}
++
++static void RENDER_RetainCompletedSourceFrame(void)
++{
++	const Bitu width = render.src.width;
++	const Bitu height = render.src.height;
++	const Bitu source_bpp = render.src.bpp;
++	const Bitu source_bytes = source_bpp == 8 ? 1 : source_bpp == 15 || source_bpp == 16 ? 2 :
++	                          source_bpp == 32 ? 4 : 0;
++	if (!scalerSourceCacheBuffer || !source_bytes || !width || !height ||
++	    width > 4096U || height > 4096U || width > 4194304U / height ||
++	    render.scale.cachePitch < width * source_bytes ||
++	    scalerSourceCacheBufferSize < render.scale.cachePitch * height) {
++		stopped_snapshot_width = 0;
++		return;
++	}
++	const size_t required = static_cast<size_t>(render.scale.cachePitch) * height;
++	if (required > stopped_snapshot_staging_size) {
++		uint8_t *replacement = static_cast<uint8_t *>(realloc(stopped_snapshot_staging, required));
++		if (!replacement) {
++			stopped_snapshot_cache_allocation_failed = true;
++			return;
++		}
++		stopped_snapshot_staging = replacement;
++		stopped_snapshot_staging_size = required;
++	}
++	memcpy(stopped_snapshot_staging, scalerSourceCacheBuffer, required);
++	/* Render and control commands share the emulator thread, but publishing by
++	 * swap also keeps a future reader from observing a partially copied frame. */
++	std::swap(stopped_snapshot_source, stopped_snapshot_staging);
++	std::swap(stopped_snapshot_source_size, stopped_snapshot_staging_size);
++	stopped_snapshot_width = width;
++	stopped_snapshot_height = height;
++	stopped_snapshot_pitch = render.scale.cachePitch;
++	stopped_snapshot_source_bpp = source_bpp;
++	stopped_snapshot_palette = render.pal;
++	stopped_snapshot_cache_allocation_failed = false;
++	++stopped_snapshot_frame_generation;
++}
++
++std::string RENDER_SaveStoppedSnapshot(const std::string &name)
++{
++#if !C_SSHOT
++	(void)name;
++	return "ERR SNAPSHOT_NOT_COMPILED";
++#else
++	if (!RENDER_IsSafeSnapshotName(name)) return "ERR SNAPSHOT_NAME_1_32_SAFE_ASCII_PNG";
++	if (stopped_snapshot_cache_allocation_failed) return "ERR SNAPSHOT_CACHE_ALLOCATION";
++	const Bitu width = stopped_snapshot_width;
++	const Bitu height = stopped_snapshot_height;
++	const Bitu source_bpp = stopped_snapshot_source_bpp;
++	const Bitu source_bytes = source_bpp == 8 ? 1 : source_bpp == 15 || source_bpp == 16 ? 2 :
++	                          source_bpp == 32 ? 4 : 0;
++	if (!stopped_snapshot_source || !stopped_snapshot_frame_generation || !source_bytes ||
++	    !width || !height ||
++	    width > 4096U || height > 4096U || width > 4194304U / height ||
++	    stopped_snapshot_pitch < width * source_bytes ||
++	    stopped_snapshot_source_size < stopped_snapshot_pitch * height) {
++		return "ERR SNAPSHOT_SOURCE_UNAVAILABLE_OR_TOO_LARGE";
++	}
++	const size_t rgb_size = static_cast<size_t>(width) * height * 3U;
++	uint8_t *rgb = static_cast<uint8_t *>(malloc(rgb_size));
++	if (!rgb) return "ERR SNAPSHOT_MEMORY";
++	if (!RENDER_CopySourceAsRgb(rgb, stopped_snapshot_source, stopped_snapshot_pitch,
++	                            stopped_snapshot_palette, width, height, source_bpp)) {
++		free(rgb);
++		return "ERR SNAPSHOT_SOURCE_FORMAT";
++	}
++
++	if (capturedir.empty()) {
++		free(rgb);
++		return "ERR SNAPSHOT_CAPTURE_DIRECTORY";
++	}
++	Cross::CreateDir(capturedir);
++#if defined(WIN32)
++	if (_access(capturedir.c_str(), 0) != 0) {
++#else
++	if (access(capturedir.c_str(), 0) != 0) {
++#endif
++		free(rgb);
++		return "ERR SNAPSHOT_CAPTURE_DIRECTORY";
++	}
++	const std::string output = capturedir + CROSS_FILESPLIT + name;
++#if defined(WIN32)
++	const int open_flags = _O_CREAT | _O_EXCL | _O_WRONLY | _O_BINARY;
++	const std::string temporary = output + ".tmp-" + std::to_string(_getpid());
++	const int descriptor = _open(temporary.c_str(), open_flags, _S_IREAD | _S_IWRITE);
++#else
++	const int open_flags = O_CREAT | O_EXCL | O_WRONLY;
++	const std::string temporary = output + ".tmp-" + std::to_string(getpid());
++	const int descriptor = open(temporary.c_str(), open_flags, 0644);
++#endif
++	if (descriptor < 0) {
++		free(rgb);
++		return errno == EEXIST ? "ERR SNAPSHOT_TEMP_EXISTS" : "ERR SNAPSHOT_OPEN";
++	}
++#if defined(WIN32)
++	FILE *file = _fdopen(descriptor, "wb");
++#else
++	FILE *file = fdopen(descriptor, "wb");
++#endif
++	png_structp png = file ? png_create_write_struct(PNG_LIBPNG_VER_STRING, NULL, NULL, NULL) : NULL;
++	png_infop info = png ? png_create_info_struct(png) : NULL;
++	bool wrote = false;
++	if (png && info && setjmp(png_jmpbuf(png)) == 0) {
++		png_init_io(png, file);
++		png_set_IHDR(png, info, static_cast<png_uint_32>(width),
++		             static_cast<png_uint_32>(height), 8, PNG_COLOR_TYPE_RGB,
++		             PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
++		             PNG_FILTER_TYPE_DEFAULT);
++		png_write_info(png, info);
++		for (Bitu y = 0; y < height; ++y)
++			png_write_row(png, rgb + y * width * 3U);
++		png_write_end(png, NULL);
++		wrote = fflush(file) == 0;
++#if defined(WIN32)
++		if (wrote) wrote = _commit(descriptor) == 0;
++#else
++		if (wrote) wrote = fsync(descriptor) == 0;
++#endif
++	}
++	if (png) png_destroy_write_struct(&png, info ? &info : NULL);
++	if (file && fclose(file) != 0) wrote = false;
++	else {
++#if defined(WIN32)
++		_close(descriptor);
++#else
++		close(descriptor);
++#endif
++	}
++	free(rgb);
++	if (!wrote) {
++		remove(temporary.c_str());
++		return "ERR SNAPSHOT_PNG_WRITE";
++	}
++#if defined(WIN32)
++	const int linked = _link(temporary.c_str(), output.c_str());
++#else
++	const int linked = link(temporary.c_str(), output.c_str());
++#endif
++	const int link_error = errno;
++	remove(temporary.c_str());
++	if (linked != 0) return link_error == EEXIST ? "ERR SNAPSHOT_EXISTS" : "ERR SNAPSHOT_PUBLISH";
++
++	std::ostringstream response;
++	response << "OK SNAPSHOT=" << name << " WIDTH=" << width << " HEIGHT=" << height
++	         << " FORMAT=RGB24_PNG SOURCE=LAST_COMPLETED_RENDER_CACHE SOURCE_BPP=" << source_bpp
++	         << " FRAME_GENERATION=" << stopped_snapshot_frame_generation;
++	return response.str();
++#endif
++}
+ 
+ void scalerWriteCacheFree(void);
+ void scalerWriteCacheAlloc(unsigned int p);
+@@ -522,6 +762,7 @@ void RENDER_EndUpdate( bool abort ) {
+             if (RENDER_GetForceUpdate()) GFX_EndUpdate(nullptr);
+         }
+     }
++    if (!abort && render.active) RENDER_RetainCompletedSourceFrame();
+     render.frameskip.index = (render.frameskip.index + 1) & (RENDER_SKIP_CACHE - 1);
+     render.updating=false;
+ 

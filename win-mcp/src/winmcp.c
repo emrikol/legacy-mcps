@@ -13,7 +13,10 @@
  *   ENV      - environment (GET)
  *   EXEC     - launch programs
  *   WINDOW   - window management (LIST, FIND, TITLE, CLOSE, MOVE, SHOW, RECT, VISIBLE, ENABLED)
- *   TASK     - task management (LIST, KILL)
+ *   TASK     - task management and read-only inspection (LIST, INFO, CSIP, STACK, KILL)
+ *   MODULE   - read-only module and segment inspection (LIST, INFO, SEGMENTS)
+ *   HEAP     - read-only ToolHelp global/local heap and handle inspection
+ *   MEMORY   - bounded protected-mode reads and explicitly unsafe audited writes
  *   GDI      - graphics (SCREEN, CAPTURE)
  *   MSG      - message passing (SEND, POST)
  *   CLIP     - clipboard (GET, SET)
@@ -38,6 +41,7 @@
  */
 
 #include <windows.h>
+#include "tool_build_identity.h"
 #include <toolhelp.h>
 #include <ddeml.h>
 #include <string.h>
@@ -56,6 +60,7 @@ static char rx_path[128] = "C:\\_MAGIC_\\__WIN__.RX";
 static char st_path[128] = "C:\\_MAGIC_\\__WIN__.ST";
 static char tw_path[128] = "C:\\_MAGIC_\\__WIN__.TW";
 static char bmp_path[128] = "C:\\_MAGIC_\\__WIN__.BMP";
+static char mw_path[128] = "C:\\_MAGIC_\\__WIN__.MW";
 
 static char lr_path[128] = "C:\\_MAGIC_\\__WIN__.LR";
 
@@ -66,9 +71,17 @@ static BOOL      bInPoll = FALSE;   /* re-entrancy guard for poll_tx */
 static char      cmd_buf[512];
 static char      resp_buf[4096];
 static char      tmp_buf[1024];
+static BYTE      inspect_buf[512];
+static BYTE      write_buf[64];
+static BYTE      before_write_buf[64];
+static BYTE      after_write_buf[64];
+static BYTE      restore_verify_buf[64];
 
 #define TIMER_ID   1
-#define POLL_MS    200
+/* Automation IPC is not guest-application timing. Keep it responsive so accelerated,
+ * deterministic suites are limited by guest work rather than an artificial
+ * 200 ms command cadence. Windows may round this to its timer granularity. */
+#define POLL_MS    50
 
 /* Forward declarations */
 static void pump_messages(void);
@@ -178,6 +191,23 @@ static UINT parse_hex(const char **pp) {
     return val;
 }
 
+/* Parse a hexadecimal value wide enough for ToolHelp memory offsets. */
+static DWORD parse_hex_dword(const char **pp) {
+    DWORD val = 0;
+    const char *p = *pp;
+    while (*p == ' ') p++;
+    while ((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') ||
+           (*p >= 'A' && *p <= 'F')) {
+        char c;
+        c = *p;
+        if (c >= 'a') c -= 32;
+        val = val * 16UL + (DWORD)(c <= '9' ? c - '0' : c - 'A' + 10);
+        p++;
+    }
+    *pp = p;
+    return val;
+}
+
 /* Parse decimal */
 static int parse_dec(const char **pp) {
     int val = 0;
@@ -242,6 +272,22 @@ static BOOL write_file(const char *path, const char *data, int len) {
     return TRUE;
 }
 
+static BOOL append_file(const char *path, const char *data, int len) {
+    OFSTRUCT ofs;
+    HFILE hf;
+    UINT written;
+    hf = OpenFile(path, &ofs, OF_WRITE);
+    if (hf == HFILE_ERROR) hf = OpenFile(path, &ofs, OF_CREATE | OF_WRITE);
+    if (hf == HFILE_ERROR) return FALSE;
+    if (_llseek(hf, 0L, 2) == HFILE_ERROR) {
+        _lclose(hf);
+        return FALSE;
+    }
+    written = _lwrite(hf, data, len);
+    if (_lclose(hf) == HFILE_ERROR) return FALSE;
+    return written == (UINT)len;
+}
+
 static void delete_file(const char *path) {
     OFSTRUCT ofs;
     OpenFile(path, &ofs, OF_DELETE);
@@ -266,8 +312,10 @@ static void write_response(const char *resp) {
 static void cmd_meta(const char *arg) {
     if (prefix(arg, "PING")) {
         write_response("OK PONG");
+    } else if (prefix(arg, "IDENTITY")) {
+        write_response("OK TOOL=WINMCP PROTOCOL=0.9 BUILD=" WINMCP_BUILD_ID " FEATURES=META,PROFILE,FILE,DIR,TIME,ENV,EXEC,WINDOW,TASK,MODULE,HEAP,MEMORY,GDI,MSG,CLIP,DIALOG,DDE,TYPE,SENDKEYS,MOUSE,CLICK,MENU,FOCUS,SCROLL,CONTROL,LIST,COMBO,CHECK,UNCHECK,ABORT,WAIT,WAITFOR,EXPECT,RECORD,PLAY,CONTROL_FINDID");
     } else if (prefix(arg, "VERSION")) {
-        write_response("OK WINMCP/0.4 META,PROFILE,FILE,DIR,TIME,ENV,EXEC,WINDOW,TASK,GDI,MSG,CLIP,DIALOG,DDE,TYPE,SENDKEYS,MOUSE,CLICK,MENU,FOCUS,SCROLL,CONTROL,LIST,COMBO,CHECK,UNCHECK,ABORT,WAIT,WAITFOR,EXPECT,RECORD,PLAY");
+        write_response("OK WINMCP/0.9 META,PROFILE,FILE,DIR,TIME,ENV,EXEC,WINDOW,TASK,MODULE,HEAP,MEMORY,GDI,MSG,CLIP,DIALOG,DDE,TYPE,SENDKEYS,MOUSE,CLICK,MENU,FOCUS,SCROLL,CONTROL,LIST,COMBO,CHECK,UNCHECK,ABORT,WAIT,WAITFOR,EXPECT,RECORD,PLAY,CONTROL_FINDID");
     } else if (prefix(arg, "STATUS")) {
         wsprintf(resp_buf, "OK CMDS=%u POLL=%ums", nCmdCount, POLL_MS);
         write_response(resp_buf);
@@ -720,6 +768,52 @@ static void cmd_window(const char *arg) {
 /* TASK commands (ToolHelp API)                                  */
 /* ============================================================ */
 
+/* Find a task by its case-insensitive module name. */
+static BOOL find_task_by_module(const char *moduleName, TASKENTRY *task) {
+    task->dwSize = sizeof(TASKENTRY);
+    if (!TaskFirst(task)) return FALSE;
+    do {
+        if (lstrcmpi(task->szModule, moduleName) == 0) return TRUE;
+    } while (TaskNext(task));
+    return FALSE;
+}
+
+/* Resolve either a module name or an explicit hexadecimal task handle. */
+static BOOL resolve_task(const char *arg, TASKENTRY *task) {
+    char token[32];
+    const char *p;
+    BOOL isHandle;
+    int i;
+
+    p = next_word(arg, token, sizeof(token));
+    (void)p;
+    if (!token[0]) return FALSE;
+
+    isHandle = TRUE;
+    for (i = 0; token[i]; i++) {
+        char c;
+        c = token[i];
+        if (!((c >= '0' && c <= '9') ||
+              (c >= 'a' && c <= 'f') ||
+              (c >= 'A' && c <= 'F'))) {
+            isHandle = FALSE;
+            break;
+        }
+    }
+
+    /* Prefer a real module name so hexadecimal-looking names such as CALC work. */
+    if (find_task_by_module(token, task)) return TRUE;
+
+    if (isHandle) {
+        HTASK taskHandle;
+        p = token;
+        taskHandle = (HTASK)parse_hex(&p);
+        task->dwSize = sizeof(TASKENTRY);
+        return TaskFindHandle(task, taskHandle);
+    }
+    return find_task_by_module(token, task);
+}
+
 static void cmd_task(const char *arg) {
     if (prefix(arg, "LIST")) {
         TASKENTRY te;
@@ -742,6 +836,64 @@ static void cmd_task(const char *arg) {
         }
         write_response(resp_buf);
 
+    } else if (prefix(arg, "INFO ")) {
+        TASKENTRY te;
+        if (!resolve_task(after(arg, 5), &te)) {
+            write_response("ERR NOT_FOUND");
+            return;
+        }
+        wsprintf(resp_buf,
+                 "OK TASK=%04X MODULE=%s HMODULE=%04X HINST=%04X SS:SP=%04X:%04X STACK=%04X-%04X TOP=%04X EVENTS=%u",
+                 (UINT)te.hTask, (LPSTR)te.szModule, (UINT)te.hModule,
+                 (UINT)te.hInst, te.wSS, te.wSP, te.wStackMinimum,
+                 te.wStackBottom, te.wStackTop, te.wcEvents);
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "CSIP ")) {
+        TASKENTRY te;
+        DWORD csip;
+        if (!resolve_task(after(arg, 5), &te)) {
+            write_response("ERR NOT_FOUND");
+            return;
+        }
+        csip = TaskGetCSIP(te.hTask);
+        wsprintf(resp_buf, "OK TASK=%04X CS:IP=%04X:%04X",
+                 (UINT)te.hTask, HIWORD(csip), LOWORD(csip));
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "STACK ")) {
+        TASKENTRY te;
+        STACKTRACEENTRY frame;
+        char *rp;
+        int remain;
+        int frameIndex;
+        if (!resolve_task(after(arg, 6), &te)) {
+            write_response("ERR NOT_FOUND");
+            return;
+        }
+        lstrcpy(resp_buf, "OK");
+        rp = resp_buf + 2;
+        remain = sizeof(resp_buf) - 4;
+        frame.dwSize = sizeof(STACKTRACEENTRY);
+        frameIndex = 0;
+        if (StackTraceFirst(&frame, te.hTask)) {
+            do {
+                int n;
+                n = wsprintf(tmp_buf,
+                             " #%u=%04X:%04X SS:BP=%04X:%04X MOD=%04X SEG=%u FLAGS=%04X",
+                             frameIndex, frame.wCS, frame.wIP, frame.wSS,
+                             frame.wBP, (UINT)frame.hModule, frame.wSegment,
+                             frame.wFlags);
+                if (n >= remain) break;
+                lstrcpy(rp, tmp_buf);
+                rp += n;
+                remain -= n;
+                frameIndex++;
+                frame.dwSize = sizeof(STACKTRACEENTRY);
+            } while (StackTraceNext(&frame));
+        }
+        write_response(resp_buf);
+
     } else if (prefix(arg, "KILL ")) {
         HTASK ht;
         const char *p;
@@ -750,6 +902,516 @@ static void cmd_task(const char *arg) {
         TerminateApp(ht, NO_UAE_BOX);
         write_response("OK");
 
+    } else {
+        write_response("ERR UNKNOWN_COMMAND");
+    }
+}
+
+/* ============================================================ */
+/* MODULE commands (ToolHelp API, read-only)                     */
+/* ============================================================ */
+
+static BOOL resolve_module(const char *arg, MODULEENTRY *module) {
+    char name[MAX_MODULE_NAME + 1];
+    const char *p;
+    p = next_word(arg, name, sizeof(name));
+    (void)p;
+    if (!name[0]) return FALSE;
+    module->dwSize = sizeof(MODULEENTRY);
+    return ModuleFindName(module, name) != (HMODULE)0;
+}
+
+static void cmd_module(const char *arg) {
+    if (prefix(arg, "LIST")) {
+        MODULEENTRY module;
+        char *rp;
+        int remain;
+        module.dwSize = sizeof(MODULEENTRY);
+        lstrcpy(resp_buf, "OK");
+        rp = resp_buf + 2;
+        remain = sizeof(resp_buf) - 4;
+        if (ModuleFirst(&module)) {
+            do {
+                int n;
+                n = wsprintf(tmp_buf, " %04X:%s:%s", (UINT)module.hModule,
+                             (LPSTR)module.szModule, (LPSTR)module.szExePath);
+                if (n >= remain) break;
+                lstrcpy(rp, tmp_buf);
+                rp += n;
+                remain -= n;
+                module.dwSize = sizeof(MODULEENTRY);
+            } while (ModuleNext(&module));
+        }
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "INFO ")) {
+        MODULEENTRY module;
+        if (!resolve_module(after(arg, 5), &module)) {
+            write_response("ERR NOT_FOUND");
+            return;
+        }
+        wsprintf(resp_buf, "OK MODULE=%s HMODULE=%04X USAGE=%u PATH=%s",
+                 (LPSTR)module.szModule, (UINT)module.hModule,
+                 module.wcUsage, (LPSTR)module.szExePath);
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "SEGMENTS ")) {
+        MODULEENTRY module;
+        GLOBALENTRY segment;
+        GLOBALENTRY nextSegment;
+        char moduleName[MAX_MODULE_NAME + 1];
+        const char *p;
+        char *rp;
+        int remain;
+        WORD segmentNumber;
+        WORD startSegment;
+        WORD maximumSegments;
+        WORD returnedSegments;
+
+        p = after(arg, 9);
+        p = next_word(p, moduleName, sizeof(moduleName));
+        p = skip_sp(p);
+        startSegment = *p ? (WORD)parse_dec(&p) : 1;
+        p = skip_sp(p);
+        maximumSegments = *p ? (WORD)parse_dec(&p) : 12;
+        if (!moduleName[0] || startSegment == 0 || maximumSegments == 0 ||
+            maximumSegments > 32) {
+            write_response("ERR RANGE START>=1 COUNT=1-32");
+            return;
+        }
+        module.dwSize = sizeof(MODULEENTRY);
+        if (ModuleFindName(&module, moduleName) == (HMODULE)0) {
+            write_response("ERR NOT_FOUND");
+            return;
+        }
+        wsprintf(resp_buf, "OK MODULE=%s START=%u", (LPSTR)module.szModule,
+                 startSegment);
+        rp = resp_buf + lstrlen(resp_buf);
+        remain = sizeof(resp_buf) - lstrlen(resp_buf) - 1;
+        returnedSegments = 0;
+        for (segmentNumber = startSegment;
+             segmentNumber <= 255 && returnedSegments < maximumSegments;
+             segmentNumber++) {
+            WORD selector;
+            int n;
+            segment.dwSize = sizeof(GLOBALENTRY);
+            /* Movable/discardable Win16 modules can have unloaded gaps. */
+            if (!GlobalEntryModule(&segment, module.hModule, segmentNumber)) continue;
+            selector = GlobalHandleToSel(segment.hBlock);
+            n = wsprintf(tmp_buf,
+                         " SEG=%u SEL=%04X HANDLE=%04X TYPE=%u DATA=%u BASE=%08lX SIZE=%08lX FLAGS=%04X LOCKS=%u",
+                         segmentNumber, selector, (UINT)segment.hBlock,
+                         segment.wType, segment.wData, segment.dwAddress,
+                         segment.dwBlockSize, segment.wFlags, segment.wcLock);
+            if (n >= remain) break;
+            lstrcpy(rp, tmp_buf);
+            rp += n;
+            remain -= n;
+            returnedSegments++;
+        }
+        while (segmentNumber <= 255) {
+            nextSegment.dwSize = sizeof(GLOBALENTRY);
+            if (GlobalEntryModule(&nextSegment, module.hModule, segmentNumber)) break;
+            segmentNumber++;
+        }
+        if (segmentNumber <= 255)
+            wsprintf(tmp_buf, " NEXT=%u", segmentNumber);
+        else
+            lstrcpy(tmp_buf, " NEXT=0");
+        if (lstrlen(tmp_buf) < remain) lstrcpy(rp, tmp_buf);
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "PROC ")) {
+        MODULEENTRY module;
+        char moduleName[MAX_MODULE_NAME + 1];
+        char procedureName[64];
+        const char *p;
+        FARPROC procedure;
+
+        p = after(arg, 5);
+        p = next_word(p, moduleName, sizeof(moduleName));
+        p = next_word(p, procedureName, sizeof(procedureName));
+        p = skip_sp(p);
+        if (!moduleName[0] || !procedureName[0] || *p) {
+            write_response("ERR SYNTAX MODULE PROC <module> <name-or-#ordinal>");
+            return;
+        }
+        module.dwSize = sizeof(MODULEENTRY);
+        if (ModuleFindName(&module, moduleName) == (HMODULE)0) {
+            write_response("ERR NOT_FOUND");
+            return;
+        }
+        if (procedureName[0] == '#') {
+            const char *ordinalText;
+            UINT ordinal;
+            DWORD ordinalValue;
+            ordinalText = procedureName + 1;
+            ordinalValue = 0;
+            while (*ordinalText >= '0' && *ordinalText <= '9') {
+                ordinalValue = ordinalValue * 10UL +
+                               (DWORD)(*ordinalText - '0');
+                if (ordinalValue > 65535UL) break;
+                ordinalText++;
+            }
+            if (!ordinalValue || ordinalValue > 65535UL || *ordinalText) {
+                write_response("ERR INVALID_ORDINAL");
+                return;
+            }
+            ordinal = (UINT)ordinalValue;
+            procedure = GetProcAddress((HINSTANCE)module.hModule,
+                                       MAKEINTRESOURCE(ordinal));
+        } else {
+            procedure = GetProcAddress((HINSTANCE)module.hModule, procedureName);
+        }
+        if (!procedure) {
+            write_response("ERR PROC_NOT_FOUND");
+            return;
+        }
+        wsprintf(resp_buf, "OK MODULE=%s PROC=%s ADDRESS=%04X:%04X",
+                 (LPSTR)module.szModule, (LPSTR)procedureName,
+                 HIWORD((DWORD)procedure), LOWORD((DWORD)procedure));
+        write_response(resp_buf);
+
+    } else {
+        write_response("ERR UNKNOWN_COMMAND");
+    }
+}
+
+/* ============================================================ */
+/* HEAP commands (ToolHelp API, handles remain opaque)           */
+/* ============================================================ */
+
+static void append_global_entry(char **responsePointer, int *remaining,
+                                WORD index, GLOBALENTRY *entry) {
+    int n;
+    WORD selector;
+
+    selector = entry->wType == GT_FREE ? 0 : GlobalHandleToSel(entry->hBlock);
+    n = wsprintf(tmp_buf,
+                 " ENTRY=%u,HANDLE=%04X,SEL=%04X,ADDRESS=%08lX,SIZE=%08lX,OWNER=%04X,TYPE=%u,DATA=%u,FLAGS=%04X,LOCKS=%u,PAGELOCKS=%u,LOCAL=%u",
+                 index, (UINT)entry->hBlock, selector, entry->dwAddress,
+                 entry->dwBlockSize, (UINT)entry->hOwner, entry->wType,
+                 entry->wData, entry->wFlags, entry->wcLock,
+                 entry->wcPageLock, entry->wHeapPresent ? 1 : 0);
+    if (n < *remaining) {
+        lstrcpy(*responsePointer, tmp_buf);
+        *responsePointer += n;
+        *remaining -= n;
+    }
+}
+
+static void cmd_heap(const char *arg) {
+    if (prefix(arg, "SUMMARY")) {
+        GLOBALINFO globalInfo;
+        MEMMANINFO memoryInfo;
+        SYSHEAPINFO systemHeap;
+
+        globalInfo.dwSize = sizeof(GLOBALINFO);
+        memoryInfo.dwSize = sizeof(MEMMANINFO);
+        systemHeap.dwSize = sizeof(SYSHEAPINFO);
+        if (!GlobalInfo(&globalInfo) || !MemManInfo(&memoryInfo) ||
+            !SystemHeapInfo(&systemHeap)) {
+            write_response("ERR TOOLHELP_FAILED");
+            return;
+        }
+        wsprintf(resp_buf,
+                 "OK GLOBAL=%u FREEITEMS=%u LRU=%u LARGEST=%08lX FREE_LINEAR=%08lX FREE_PAGES=%08lX TOTAL_PAGES=%08lX PAGE_SIZE=%u USER_FREE=%u GDI_FREE=%u USER_HEAP=%04X GDI_HEAP=%04X",
+                 globalInfo.wcItems, globalInfo.wcItemsFree,
+                 globalInfo.wcItemsLRU, memoryInfo.dwLargestFreeBlock,
+                 memoryInfo.dwFreeLinearSpace, memoryInfo.dwFreePages,
+                 memoryInfo.dwTotalPages, memoryInfo.wPageSize,
+                 systemHeap.wUserFreePercent, systemHeap.wGDIFreePercent,
+                 (UINT)systemHeap.hUserSegment, (UINT)systemHeap.hGDISegment);
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "GLOBAL")) {
+        const char *p;
+        WORD startIndex;
+        WORD maximumEntries;
+        WORD entryIndex;
+        WORD returnedEntries;
+        GLOBALENTRY entry;
+        char *responsePointer;
+        int remaining;
+        BOOL available;
+
+        p = skip_sp(after(arg, 6));
+        startIndex = *p ? (WORD)parse_dec(&p) : 0;
+        p = skip_sp(p);
+        maximumEntries = *p ? (WORD)parse_dec(&p) : 12;
+        if (maximumEntries == 0 || maximumEntries > 24) {
+            write_response("ERR RANGE COUNT=1-24");
+            return;
+        }
+        wsprintf(resp_buf, "OK START=%u", startIndex);
+        responsePointer = resp_buf + lstrlen(resp_buf);
+        remaining = sizeof(resp_buf) - lstrlen(resp_buf) - 1;
+        entry.dwSize = sizeof(GLOBALENTRY);
+        available = GlobalFirst(&entry, GLOBAL_ALL);
+        entryIndex = 0;
+        while (available && entryIndex < startIndex) {
+            entry.dwSize = sizeof(GLOBALENTRY);
+            available = GlobalNext(&entry, GLOBAL_ALL);
+            entryIndex++;
+        }
+        returnedEntries = 0;
+        while (available && returnedEntries < maximumEntries) {
+            append_global_entry(&responsePointer, &remaining, entryIndex, &entry);
+            returnedEntries++;
+            entryIndex++;
+            entry.dwSize = sizeof(GLOBALENTRY);
+            available = GlobalNext(&entry, GLOBAL_ALL);
+        }
+        wsprintf(tmp_buf, " NEXT=%u", available ? entryIndex : 0);
+        if (lstrlen(tmp_buf) < remaining) lstrcpy(responsePointer, tmp_buf);
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "HANDLE ")) {
+        const char *p;
+        HGLOBAL handle;
+        GLOBALENTRY entry;
+        char *responsePointer;
+        int remaining;
+
+        p = after(arg, 7);
+        handle = (HGLOBAL)parse_hex(&p);
+        p = skip_sp(p);
+        if (handle == (HGLOBAL)0 || *p) {
+            write_response("ERR SYNTAX");
+            return;
+        }
+        entry.dwSize = sizeof(GLOBALENTRY);
+        if (!GlobalEntryHandle(&entry, handle)) {
+            write_response("ERR INVALID_HANDLE");
+            return;
+        }
+        lstrcpy(resp_buf, "OK");
+        responsePointer = resp_buf + 2;
+        remaining = sizeof(resp_buf) - 3;
+        append_global_entry(&responsePointer, &remaining, 0, &entry);
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "LOCAL ")) {
+        const char *p;
+        HGLOBAL heapHandle;
+        WORD startIndex;
+        WORD maximumEntries;
+        WORD entryIndex;
+        WORD returnedEntries;
+        GLOBALENTRY globalEntry;
+        LOCALENTRY localEntry;
+        char *responsePointer;
+        int remaining;
+        BOOL available;
+
+        p = after(arg, 6);
+        heapHandle = (HGLOBAL)parse_hex(&p);
+        p = skip_sp(p);
+        startIndex = *p ? (WORD)parse_dec(&p) : 0;
+        p = skip_sp(p);
+        maximumEntries = *p ? (WORD)parse_dec(&p) : 12;
+        if (heapHandle == (HGLOBAL)0 || maximumEntries == 0 ||
+            maximumEntries > 24) {
+            write_response("ERR RANGE COUNT=1-24");
+            return;
+        }
+        globalEntry.dwSize = sizeof(GLOBALENTRY);
+        if (!GlobalEntryHandle(&globalEntry, heapHandle)) {
+            write_response("ERR INVALID_HANDLE");
+            return;
+        }
+        if (!globalEntry.wHeapPresent) {
+            write_response("ERR NO_LOCAL_HEAP");
+            return;
+        }
+        wsprintf(resp_buf, "OK HEAP=%04X START=%u", (UINT)heapHandle,
+                 startIndex);
+        responsePointer = resp_buf + lstrlen(resp_buf);
+        remaining = sizeof(resp_buf) - lstrlen(resp_buf) - 1;
+        localEntry.dwSize = sizeof(LOCALENTRY);
+        available = LocalFirst(&localEntry, heapHandle);
+        entryIndex = 0;
+        while (available && entryIndex < startIndex) {
+            localEntry.dwSize = sizeof(LOCALENTRY);
+            available = LocalNext(&localEntry);
+            entryIndex++;
+        }
+        returnedEntries = 0;
+        while (available && returnedEntries < maximumEntries) {
+            int n;
+            n = wsprintf(tmp_buf,
+                         " ENTRY=%u,HANDLE=%04X,ADDRESS=%04X,SIZE=%04X,FLAGS=%04X,LOCKS=%u,TYPE=%u,HEAPTYPE=%u",
+                         entryIndex, (UINT)localEntry.hHandle,
+                         localEntry.wAddress, localEntry.wSize,
+                         localEntry.wFlags, localEntry.wcLock,
+                         localEntry.wType, localEntry.wHeapType);
+            if (n < remaining) {
+                lstrcpy(responsePointer, tmp_buf);
+                responsePointer += n;
+                remaining -= n;
+            }
+            returnedEntries++;
+            entryIndex++;
+            localEntry.dwSize = sizeof(LOCALENTRY);
+            available = LocalNext(&localEntry);
+        }
+        wsprintf(tmp_buf, " NEXT=%u", available ? entryIndex : 0);
+        if (lstrlen(tmp_buf) < remaining) lstrcpy(responsePointer, tmp_buf);
+        write_response(resp_buf);
+    } else {
+        write_response("ERR UNKNOWN_COMMAND");
+    }
+}
+
+/* ============================================================ */
+/* MEMORY commands (bounded inspection and audited unsafe writes) */
+/* ============================================================ */
+
+static BOOL restore_memory(WORD selector, DWORD offset,
+                           const BYTE FAR *original, UINT byteCount) {
+    DWORD bytesWritten;
+    DWORD bytesVerified;
+    bytesWritten = MemoryWrite(selector, offset, original, byteCount);
+    if (bytesWritten != byteCount) return FALSE;
+    bytesVerified = MemoryRead(selector, offset, restore_verify_buf, byteCount);
+    return bytesVerified == byteCount &&
+           _fmemcmp(original, restore_verify_buf, byteCount) == 0;
+}
+
+static void cmd_memory(const char *arg) {
+    if (prefix(arg, "READ ")) {
+        const char *p;
+        WORD selector;
+        DWORD offset;
+        DWORD requested;
+        DWORD bytesRead;
+        char *rp;
+        int remain;
+        UINT i;
+
+        p = after(arg, 5);
+        selector = (WORD)parse_hex(&p);
+        if (*p != ':') { write_response("ERR SYNTAX"); return; }
+        p++;
+        offset = parse_hex_dword(&p);
+        p = skip_sp(p);
+        requested = *p ? (DWORD)parse_dec(&p) : 16UL;
+        if (selector == 0 || requested == 0 || requested > sizeof(inspect_buf)) {
+            write_response("ERR RANGE MAX=512");
+            return;
+        }
+
+        bytesRead = MemoryRead(selector, offset, inspect_buf, requested);
+        if (bytesRead == 0) {
+            write_response("ERR READ_FAILED");
+            return;
+        }
+
+        wsprintf(resp_buf, "OK %04X:%08lX N=%lu", selector, offset, bytesRead);
+        rp = resp_buf + lstrlen(resp_buf);
+        remain = sizeof(resp_buf) - lstrlen(resp_buf) - 1;
+        for (i = 0; i < (UINT)bytesRead; i++) {
+            int n;
+            n = wsprintf(tmp_buf, " %02X", inspect_buf[i]);
+            if (n >= remain) break;
+            lstrcpy(rp, tmp_buf);
+            rp += n;
+            remain -= n;
+        }
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "WRITE UNSAFE ")) {
+        const char *p;
+        WORD selector;
+        DWORD offset;
+        DWORD bytesRead;
+        DWORD bytesWritten;
+        DWORD bytesVerified;
+        UINT byteCount;
+        UINT i;
+        char *rp;
+        int remain;
+
+        p = after(arg, 13);
+        selector = (WORD)parse_hex(&p);
+        if (*p != ':') { write_response("ERR SYNTAX"); return; }
+        p++;
+        offset = parse_hex_dword(&p);
+        byteCount = 0;
+        p = skip_sp(p);
+        while (*p) {
+            UINT value;
+            const char *start;
+            start = p;
+            value = parse_hex(&p);
+            if (p == start || p - start != 2 || value > 0xFF ||
+                (*p && *p != ' ')) {
+                write_response("ERR SYNTAX BYTES=two-digit-hex");
+                return;
+            }
+            if (byteCount >= sizeof(write_buf)) {
+                write_response("ERR RANGE MAX=64");
+                return;
+            }
+            write_buf[byteCount++] = (BYTE)value;
+            p = skip_sp(p);
+        }
+        if (selector == 0 || byteCount == 0) {
+            write_response("ERR SYNTAX");
+            return;
+        }
+
+        bytesRead = MemoryRead(selector, offset, before_write_buf, byteCount);
+        if (bytesRead != byteCount) {
+            write_response("ERR READ_BEFORE_FAILED");
+            return;
+        }
+        bytesWritten = MemoryWrite(selector, offset, write_buf, byteCount);
+        bytesVerified = MemoryRead(selector, offset, after_write_buf, byteCount);
+        if (bytesWritten != byteCount || bytesVerified != byteCount ||
+            _fmemcmp(write_buf, after_write_buf, byteCount) != 0) {
+            BOOL restored;
+            restored = restore_memory(selector, offset, before_write_buf, byteCount);
+            wsprintf(resp_buf, "ERR VERIFY_FAILED RESTORED=%s",
+                     restored ? (LPSTR)"TRUE" : (LPSTR)"FALSE");
+            write_response(resp_buf);
+            return;
+        }
+
+        wsprintf(resp_buf, "OK MUTATED=1 %04X:%08lX N=%u BEFORE=",
+                 selector, offset, byteCount);
+        rp = resp_buf + lstrlen(resp_buf);
+        remain = sizeof(resp_buf) - lstrlen(resp_buf) - 1;
+        for (i = 0; i < byteCount; i++) {
+            int n;
+            n = wsprintf(tmp_buf, "%02X", before_write_buf[i]);
+            if (n >= remain) break;
+            lstrcpy(rp, tmp_buf);
+            rp += n;
+            remain -= n;
+        }
+        lstrcpy(rp, " AFTER=");
+        rp += 7;
+        remain -= 7;
+        for (i = 0; i < byteCount; i++) {
+            int n;
+            n = wsprintf(tmp_buf, "%02X", after_write_buf[i]);
+            if (n >= remain) break;
+            lstrcpy(rp, tmp_buf);
+            rp += n;
+            remain -= n;
+        }
+        lstrcpy(tmp_buf, resp_buf);
+        lstrcat(tmp_buf, "\r\n");
+        if (!append_file(mw_path, tmp_buf, lstrlen(tmp_buf))) {
+            BOOL restored;
+            restored = restore_memory(selector, offset, before_write_buf, byteCount);
+            wsprintf(resp_buf, "ERR AUDIT_FAILED RESTORED=%s",
+                     restored ? (LPSTR)"TRUE" : (LPSTR)"FALSE");
+            write_response(resp_buf);
+            return;
+        }
+        write_response(resp_buf);
     } else {
         write_response("ERR UNKNOWN_COMMAND");
     }
@@ -1068,6 +1730,36 @@ static void cmd_dialog(const char *arg) {
         text = skip_sp(p);
         if (!IsWindow(hwnd)) { write_response("ERR INVALID_HWND"); return; }
         SetDlgItemText(hwnd, id, text);
+        write_response("OK");
+
+    } else if (prefix(arg, "TYPE ")) {
+        int id;
+        HWND ctrl;
+        const char *text;
+        p = after(arg, 5);
+        hwnd = (HWND)parse_hex(&p);
+        p = skip_sp(p); id = parse_dec(&p);
+        text = skip_sp(p);
+        if (!IsWindow(hwnd)) { write_response("ERR INVALID_HWND"); return; }
+        ctrl = GetDlgItem(hwnd, id);
+        if (!ctrl) { write_response("ERR NOT_FOUND"); return; }
+        if (!*text) { write_response("ERR SYNTAX"); return; }
+        SetFocus(ctrl);
+        while (*text) {
+            char ch = *text;
+            if (ch == '\\' && text[1]) {
+                text++;
+                switch (*text) {
+                case 'n': ch = '\r'; break;
+                case 't': ch = '\t'; break;
+                case 'e': ch = 0x1B; break;
+                case '\\': ch = '\\'; break;
+                default: ch = *text; break;
+                }
+            }
+            SendMessage(ctrl, WM_CHAR, (WPARAM)(BYTE)ch, 0L);
+            text++;
+        }
         write_response("OK");
 
     } else if (prefix(arg, "CLICK ")) {
@@ -1592,12 +2284,82 @@ static BOOL FAR PASCAL EnumCtrlFindProc(HWND hwnd, LPARAM lParam) {
     return FALSE;  /* stop enumeration */
 }
 
+static BOOL parse_control_findid(const char *arg, HWND *parent, int *id) {
+    char hwnd_token[8], id_token[8];
+    const char *p;
+    DWORD hwnd_value, id_value;
+    int i;
+
+    p = next_word(arg, hwnd_token, sizeof(hwnd_token));
+    p = next_word(p, id_token, sizeof(id_token));
+    if (*skip_sp(p) || !hwnd_token[0] || !id_token[0] ||
+        lstrlen(hwnd_token) > 4 || lstrlen(id_token) > 5) return FALSE;
+    hwnd_value = 0;
+    for (i = 0; hwnd_token[i]; i++) {
+        char c;
+        c = hwnd_token[i];
+        if (c >= 'a' && c <= 'f') c -= 32;
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) return FALSE;
+        hwnd_value = hwnd_value * 16UL +
+            (DWORD)(c <= '9' ? c - '0' : c - 'A' + 10);
+    }
+    id_value = 0;
+    for (i = 0; id_token[i]; i++) {
+        if (id_token[i] < '0' || id_token[i] > '9') return FALSE;
+        id_value = id_value * 10UL + (DWORD)(id_token[i] - '0');
+        if (id_value > 32767UL) return FALSE;
+    }
+    if (!hwnd_value || !id_value) return FALSE;
+    *parent = (HWND)(UINT)hwnd_value;
+    *id = (int)id_value;
+    return TRUE;
+}
+
 static void cmd_control(const char *arg) {
-    /* CONTROL FIND <hwnd> <class> <text> */
+    /* CONTROL FIND <hwnd> <class> <text>
+     * CONTROL FINDID <hwnd> <id> */
     const char *p;
     HWND hwnd;
 
-    if (prefix(arg, "FIND ")) {
+    if (prefix(arg, "FINDID ")) {
+        int id;
+        HWND child, found;
+        BOOL ambiguous, inspection_failed;
+        p = after(arg, 7);
+        if (!parse_control_findid(p, &hwnd, &id)) {
+            write_response("ERR SYNTAX");
+            return;
+        }
+        if (!IsWindow(hwnd)) { write_response("ERR INVALID_HWND"); return; }
+        found = NULL;
+        ambiguous = FALSE;
+        inspection_failed = FALSE;
+        child = GetWindow(hwnd, GW_CHILD);
+        while (child) {
+            if (!IsWindow(hwnd) || !IsWindow(child) || GetParent(child) != hwnd) {
+                inspection_failed = TRUE;
+                break;
+            }
+            if (GetDlgCtrlID(child) == id) {
+                if (found) { ambiguous = TRUE; break; }
+                found = child;
+            }
+            child = GetWindow(child, GW_HWNDNEXT);
+        }
+        if (inspection_failed || !IsWindow(hwnd)) {
+            write_response("ERR CONTROL_INSPECTION");
+            return;
+        }
+        if (ambiguous) { write_response("ERR AMBIGUOUS_CONTROL"); return; }
+        if (!found) { write_response("ERR NOT_FOUND"); return; }
+        if (!IsWindow(found) || GetParent(found) != hwnd || GetDlgCtrlID(found) != id) {
+            write_response("ERR CONTROL_INSPECTION");
+            return;
+        }
+        wsprintf(resp_buf, "OK %04X", (UINT)found);
+        write_response(resp_buf);
+
+    } else if (prefix(arg, "FIND ")) {
         p = after(arg, 5);
         hwnd = (HWND)parse_hex(&p);
         p = next_word(p, cf_class, sizeof(cf_class));
@@ -2041,6 +2803,9 @@ static void dispatch_command(void) {
     if (prefix(c, "EXEC "))     { cmd_exec(c + 5); return; }
     if (prefix(c, "WINDOW "))   { cmd_window(c + 7); return; }
     if (prefix(c, "TASK "))     { cmd_task(c + 5); return; }
+    if (prefix(c, "MODULE "))   { cmd_module(c + 7); return; }
+    if (prefix(c, "HEAP "))     { cmd_heap(c + 5); return; }
+    if (prefix(c, "MEMORY "))   { cmd_memory(c + 7); return; }
     if (prefix(c, "GDI "))      { cmd_gdi(c + 4); return; }
     if (prefix(c, "MSG "))      { cmd_msg(c + 4); return; }
     if (prefix(c, "CLIP "))     { cmd_clip(c + 5); return; }
@@ -2150,6 +2915,7 @@ int PASCAL WinMain(HINSTANCE hInstance, HINSTANCE hPrev,
         st_path[0] = drv;
         tw_path[0] = drv;
         bmp_path[0] = drv;
+        mw_path[0] = drv;
         lr_path[0] = drv;
         evt_path[0] = drv;
     }

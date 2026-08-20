@@ -1,70 +1,30 @@
-diff --git a/src/gui/Makefile.am b/src/gui/Makefile.am
-index 4e16f71..730c77c 100644
---- a/src/gui/Makefile.am
-+++ b/src/gui/Makefile.am
-@@ -10,7 +10,8 @@ libgui_a_SOURCES = \
- 	render_templates_hq2x.h render_templates_hq3x.h \
- 	midi.cpp midi_win32.h midi_oss.h midi_coreaudio.h \
- 	midi_alsa.h midi_coremidi.h sdl_gui.cpp dosbox_splash.h \
--	menu.cpp menu_callback.cpp bitop.cpp ptrop.cpp zipcrc.c zipfile.cpp
-+	menu.cpp menu_callback.cpp bitop.cpp ptrop.cpp zipcrc.c zipfile.cpp \
-+	dosbox_control_server.cpp
- 
- if C_MT32
- AM_CPPFLAGS += -I$(top_srcdir)/src/libs/mt32
-diff --git a/src/gui/sdlmain.cpp b/src/gui/sdlmain.cpp
-index 77f4f32..c919c87 100644
---- a/src/gui/sdlmain.cpp
-+++ b/src/gui/sdlmain.cpp
-@@ -4128,7 +4128,7 @@ static void GUI_StartUp() {
-     {
- #if C_DIRECT3D
-         if(!init_output) OUTPUT_DIRECT3D_Select();
--#elif C_OPENGL && defined(MACOSX) // JC: This is breaking SDL1 on Linux! Limit this to MAC OS! Windows users may use this if needed.
-+#elif C_OPENGL && defined(MACOSX) && !defined(__arm64__) // JC: This is breaking SDL1 on Linux! Limit this to MAC OS! Windows users may use this if needed.
-         if(!init_output) OUTPUT_OPENGL_Select(GLBilinear); // Initialize screen before switching to TTF (required for macOS builds)
- #endif
-         OUTPUT_SURFACE_Select();
-@@ -8459,6 +8459,15 @@ int main(int argc, char* argv[]) SDL_MAIN_NOEXCEPT {
-     bitop::self_test();
-     ptrop::self_test();
- 
-+    // Initialize control server for external automation
-+    {
-+        extern void ControlServer_Init(int port);
-+        extern void ControlServer_Shutdown();
-+        const char *port_env = getenv("DOSBOX_CONTROL_PORT");
-+        int port = port_env ? atoi(port_env) : 0;
-+        if (port > 0) ControlServer_Init(port);
-+    }
-+
-     // initialize output libraries
-     OUTPUT_SURFACE_Initialize();
- #if C_OPENGL
-diff --git a/src/hardware/hardware.cpp b/src/hardware/hardware.cpp
-index 5c2037d..441c795 100644
---- a/src/hardware/hardware.cpp
-+++ b/src/hardware/hardware.cpp
-@@ -970,6 +970,13 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
- 		fclose(fp);
- 		if (show_recorded_filename && pathscr.size()) systemmessagebox("Recording completed",("Saved screenshot to the file:\n\n"+pathscr).c_str(),"ok", "info", 1);
- 
-+		/* Notify control server if it requested this screenshot */
-+		{
-+			extern bool ControlServer_ScreenshotRequested();
-+			extern void ControlServer_ScreenshotComplete();
-+			if (ControlServer_ScreenshotRequested())
-+				ControlServer_ScreenshotComplete();
-+		}
- 	}
- 	pathscr = "";
- skip_shot:
+From af40450da632fe7cb039d689429039b394d31c84 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 28 Mar 2026 00:14:55 -0400
+Subject: [PATCH 02/19] feat: add ALT/CTRL/SHIFT modifier support + CLICK
+ command to control server
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+KEY command now supports modifiers: KEY ALT+F, KEY CTRL+C, KEY SHIFT+A
+Single letter keys now map correctly via lookup table (QWERTY order).
+
+CLICK x y command added (SDL event injection) — currently non-functional
+from background thread, needs main-thread dispatch. Left as placeholder.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/gui/dosbox_control_server.cpp | 443 ++++++++++++++++++++++++++++++
+ 1 file changed, 443 insertions(+)
+ create mode 100644 src/gui/dosbox_control_server.cpp
+
 diff --git a/src/gui/dosbox_control_server.cpp b/src/gui/dosbox_control_server.cpp
 new file mode 100644
-index 0000000..526153d
+index 0000000..6b91120
 --- /dev/null
 +++ b/src/gui/dosbox_control_server.cpp
-@@ -0,0 +1,360 @@
+@@ -0,0 +1,443 @@
 +/*
 + * DOSBox-X Control Server
 + *
@@ -87,6 +47,8 @@ index 0000000..526153d
 +#include <string>
 +#include <thread>
 +#include <atomic>
++
++#include "SDL.h"
 +
 +#include <sys/socket.h>
 +#include <sys/types.h>
@@ -288,8 +250,20 @@ index 0000000..526153d
 +         * Names: ENTER, ESC, TAB, SPACE, UP, DOWN, LEFT, RIGHT,
 +         *        F1-F12, BACKSPACE, DELETE, HOME, END, PGUP, PGDN,
 +         *        Y, N (single chars for quick yes/no)
++         * Modifiers: ALT+<key>, CTRL+<key>, SHIFT+<key>
 +         */
 +        std::string key = c.substr(4);
++
++        /* Parse modifier prefix */
++        bool useAlt = false, useCtrl = false, useShift = false;
++        size_t plus;
++        while ((plus = key.find('+')) != std::string::npos) {
++            std::string mod = key.substr(0, plus);
++            key = key.substr(plus + 1);
++            if (mod == "ALT") useAlt = true;
++            else if (mod == "CTRL") useCtrl = true;
++            else if (mod == "SHIFT") useShift = true;
++        }
 +        KBD_KEYS k = KBD_NONE;
 +        if (key == "ENTER") k = KBD_enter;
 +        else if (key == "ESC") k = KBD_esc;
@@ -318,17 +292,86 @@ index 0000000..526153d
 +        else if (key == "F11") k = KBD_f11;
 +        else if (key == "F12") k = KBD_f12;
 +        else if (key == "INSERT") k = KBD_insert;
-+        else if (key.length() == 1 && key[0] >= 'A' && key[0] <= 'Z') {
-+            /* Single letter — add to BIOS buffer */
-+            BIOS_AddKeyToBuffer((uint16_t)(unsigned char)key[0]);
-+            return "OK\n";
++        else if (key.length() == 1) {
++            /* Single character — map via lookup table (KBD enum is QWERTY order) */
++            static const struct { char ch; KBD_KEYS k; } charMap[] = {
++                {'A',KBD_a},{'B',KBD_b},{'C',KBD_c},{'D',KBD_d},{'E',KBD_e},
++                {'F',KBD_f},{'G',KBD_g},{'H',KBD_h},{'I',KBD_i},{'J',KBD_j},
++                {'K',KBD_k},{'L',KBD_l},{'M',KBD_m},{'N',KBD_n},{'O',KBD_o},
++                {'P',KBD_p},{'Q',KBD_q},{'R',KBD_r},{'S',KBD_s},{'T',KBD_t},
++                {'U',KBD_u},{'V',KBD_v},{'W',KBD_w},{'X',KBD_x},{'Y',KBD_y},
++                {'Z',KBD_z},
++                {'0',KBD_0},{'1',KBD_1},{'2',KBD_2},{'3',KBD_3},{'4',KBD_4},
++                {'5',KBD_5},{'6',KBD_6},{'7',KBD_7},{'8',KBD_8},{'9',KBD_9},
++                {0, KBD_NONE}
++            };
++            char upper = (key[0] >= 'a' && key[0] <= 'z') ? (char)(key[0] - 32) : key[0];
++            k = KBD_NONE;
++            for (int ci = 0; charMap[ci].ch; ci++) {
++                if (charMap[ci].ch == upper) { k = charMap[ci].k; break; }
++            }
++            if (k == KBD_NONE) return "ERR UNKNOWN_KEY\n";
 +        }
 +        else return "ERR UNKNOWN_KEY\n";
 +
++        /* Press modifiers */
++        if (useAlt) KEYBOARD_AddKey(KBD_leftalt, true);
++        if (useCtrl) KEYBOARD_AddKey(KBD_leftctrl, true);
++        if (useShift) KEYBOARD_AddKey(KBD_leftshift, true);
++        usleep(10000);
++
 +        KEYBOARD_AddKey(k, true);
-+        usleep(20000); /* 20ms between press and release */
++        usleep(30000); /* 30ms between press and release */
 +        KEYBOARD_AddKey(k, false);
++
++        /* Release modifiers */
++        usleep(10000);
++        if (useShift) KEYBOARD_AddKey(KBD_leftshift, false);
++        if (useCtrl) KEYBOARD_AddKey(KBD_leftctrl, false);
++        if (useAlt) KEYBOARD_AddKey(KBD_leftalt, false);
 +        return "OK\n";
++    }
++
++    if (c.substr(0, 5) == "CLICK" && c.length() > 6) {
++        /*
++         * CLICK <x> <y> — move mouse to (x,y) and click left button.
++         * Coordinates are in emulated screen pixels (e.g., 1024x768).
++         * Uses SDL events to inject mouse motion + click into the event queue.
++         */
++        int cx = 0, cy = 0;
++        if (sscanf(c.c_str() + 6, "%d %d", &cx, &cy) == 2) {
++            SDL_Event ev;
++            memset(&ev, 0, sizeof(ev));
++
++            /* Mouse motion to position */
++            ev.type = SDL_MOUSEMOTION;
++            ev.motion.x = cx;
++            ev.motion.y = cy;
++            ev.motion.state = 0;
++            SDL_PushEvent(&ev);
++            usleep(30000);
++
++            /* Mouse button down */
++            memset(&ev, 0, sizeof(ev));
++            ev.type = SDL_MOUSEBUTTONDOWN;
++            ev.button.button = SDL_BUTTON_LEFT;
++            ev.button.state = SDL_PRESSED;
++            ev.button.x = cx;
++            ev.button.y = cy;
++            SDL_PushEvent(&ev);
++            usleep(80000);
++
++            /* Mouse button up */
++            memset(&ev, 0, sizeof(ev));
++            ev.type = SDL_MOUSEBUTTONUP;
++            ev.button.button = SDL_BUTTON_LEFT;
++            ev.button.state = SDL_RELEASED;
++            ev.button.x = cx;
++            ev.button.y = cy;
++            SDL_PushEvent(&ev);
++            return "OK\n";
++        }
++        return "ERR CLICK_FORMAT\n";
 +    }
 +
 +    if (c == "QUIT") {

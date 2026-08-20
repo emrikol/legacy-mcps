@@ -1,0 +1,1281 @@
+From fff7f1a90207852a0c633b3928db5d80c39ed022 Mon Sep 17 00:00:00 2001
+From: Derrick Tennant <derrick.tennant@automattic.com>
+Date: Sat, 15 Aug 2026 15:28:38 -0400
+Subject: [PATCH 04/19] feat(debugger): add remote Win16 inspection controls
+
+---
+ include/debug.h     |    7 +
+ src/cpu/cpu.cpp     |    7 +
+ src/debug/debug.cpp | 1052 ++++++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 1060 insertions(+), 6 deletions(-)
+
+diff --git a/include/debug.h b/include/debug.h
+index 7a5543d..d33f22e 100644
+--- a/include/debug.h
++++ b/include/debug.h
+@@ -26,10 +26,17 @@ bool DEBUG_ExitLoop(void);
+ void DEBUG_RefreshPage(char scroll);
+ Bitu DEBUG_EnableDebugger(void);
+ 
++/* Thread-safe remote debugger bridge used by the localhost control server.
++ * Commands are executed on the emulator thread while the CPU is stopped. */
++bool DEBUG_RemoteCommand(const char *command, char *response,
++                         unsigned int response_size,
++                         unsigned int timeout_ms);
++
+ extern Bitu cycle_count;
+ extern Bitu debugCallback;
+ 
+ #ifdef C_HEAVY_DEBUG
+ bool DEBUG_HeavyIsBreakpoint(void);
++bool DEBUG_ExceptionBreakpoint(Bitu which, Bitu error);
+ void DEBUG_HeavyWriteLogInstruction(void);
+ #endif
+diff --git a/src/cpu/cpu.cpp b/src/cpu/cpu.cpp
+index 4884b8a..9768fcb 100644
+--- a/src/cpu/cpu.cpp
++++ b/src/cpu/cpu.cpp
+@@ -1164,6 +1164,13 @@ void CPU_Exception(Bitu which,Bitu error ) {
+ 		error = 0;
+ 	}
+ 
++#if C_DEBUG && C_HEAVY_DEBUG
++	/* Stop after nested faults have been normalized to #DF but before the guest
++	 * handler receives the exception. Continuing retries once with this hook
++	 * inhibited, then delivers it. */
++	if (DEBUG_ExceptionBreakpoint(which, error)) return;
++#endif
++
+ 	if (cpu_double_fault_enable) {
+ 		/* NTS: Putting some thought into it, I don't think divide by zero counts as something to throw a double fault
+ 		 *      over. I may be wrong. The behavior of Intel processors will ultimately decide.
+diff --git a/src/debug/debug.cpp b/src/debug/debug.cpp
+index 49dcd31..0f4a797 100644
+--- a/src/debug/debug.cpp
++++ b/src/debug/debug.cpp
+@@ -30,6 +30,11 @@
+ #include <iomanip>
+ #include <string>
+ #include <sstream>
++#include <atomic>
++#include <chrono>
++#include <condition_variable>
++#include <mutex>
++#include <set>
+ using namespace std;
+ 
+ #include "debug.h"
+@@ -176,6 +181,7 @@ extern int debuggerrun;
+ int debugrunmode=0;
+ bool runnormal=false;
+ bool inhibit_int_breakpoint=false;
++bool inhibit_exception_breakpoint=false;
+ 
+ void DEBUG_DrawInput(void) {
+     DrawInput();
+@@ -330,6 +336,49 @@ DBGBlock dbg;
+ extern Bitu cycle_count;
+ static bool debugging = false;
+ static bool debug_running = false;
++
++/* Remote debugger synchronization. The TCP thread only submits text requests;
++ * CPU/register/memory work is performed by the emulator thread after a
++ * heavy-debug instruction-boundary stop. */
++static std::atomic<bool> remote_debug_enabled(false);
++static std::atomic<bool> remote_pause_requested(false);
++static std::atomic<bool> remote_exception_pending(false);
++static std::atomic<bool> remote_debug_stopped(false);
++enum RemoteDebugStopReason {
++	REMOTE_STOP_NONE,
++	REMOTE_STOP_RUNNING,
++	REMOTE_STOP_PAUSE,
++	REMOTE_STOP_STEP,
++	REMOTE_STOP_NEXT,
++	REMOTE_STOP_FINISH,
++	REMOTE_STOP_BREAKPOINT,
++	REMOTE_STOP_INTERRUPT,
++	REMOTE_STOP_EXCEPTION
++};
++static std::atomic<int> remote_debug_stop_reason(REMOTE_STOP_NONE);
++static std::atomic<unsigned int> remote_exception_vector(0);
++static std::atomic<uint32_t> remote_exception_error(0);
++static std::mutex remote_debug_mutex;
++static std::condition_variable remote_debug_cv;
++static std::string remote_debug_request;
++static std::string remote_debug_response;
++static bool remote_debug_request_pending = false;
++static bool remote_debug_response_ready = false;
++
++static const char *RemoteStopReasonName(void)
++{
++	switch (remote_debug_stop_reason.load()) {
++	case REMOTE_STOP_RUNNING: return "RUNNING";
++	case REMOTE_STOP_PAUSE: return "PAUSE";
++	case REMOTE_STOP_STEP: return "STEP";
++	case REMOTE_STOP_NEXT: return "NEXT";
++	case REMOTE_STOP_FINISH: return "FINISH";
++	case REMOTE_STOP_BREAKPOINT: return "BREAKPOINT";
++	case REMOTE_STOP_INTERRUPT: return "INTERRUPT";
++	case REMOTE_STOP_EXCEPTION: return "EXCEPTION";
++	default: return "NONE";
++	}
++}
+ static bool check_rescroll = false;
+ 
+ static FPU_rec oldfpu;
+@@ -543,7 +592,28 @@ std::vector<CDebugVar*> CDebugVar::varList;
+ bool mustCompleteInstruction = false;
+ bool skipFirstInstruction = false;
+ 
+-enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_INTERRUPT, BKPNT_MEMORY, BKPNT_MEMORY_PROT, BKPNT_MEMORY_LINEAR, BKPNT_MEMORY_FREEZE };
++enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_INTERRUPT, BKPNT_EXCEPTION, BKPNT_MEMORY, BKPNT_MEMORY_PROT, BKPNT_MEMORY_LINEAR, BKPNT_MEMORY_FREEZE };
++
++enum ERemoteConditionRegister {
++	REMOTE_REG_NONE,
++	REMOTE_REG_EAX, REMOTE_REG_EBX, REMOTE_REG_ECX, REMOTE_REG_EDX,
++	REMOTE_REG_ESI, REMOTE_REG_EDI, REMOTE_REG_EBP, REMOTE_REG_ESP,
++	REMOTE_REG_EIP, REMOTE_REG_CS, REMOTE_REG_SS, REMOTE_REG_DS,
++	REMOTE_REG_ES, REMOTE_REG_FS, REMOTE_REG_GS, REMOTE_REG_FLAGS,
++	REMOTE_REG_AX, REMOTE_REG_BX, REMOTE_REG_CX, REMOTE_REG_DX,
++	REMOTE_REG_SI, REMOTE_REG_DI, REMOTE_REG_BP, REMOTE_REG_SP,
++	REMOTE_REG_IP, REMOTE_REG_AH, REMOTE_REG_AL, REMOTE_REG_BH,
++	REMOTE_REG_BL, REMOTE_REG_CH, REMOTE_REG_CL, REMOTE_REG_DH,
++	REMOTE_REG_DL
++};
++
++enum ERemoteConditionOperator {
++	REMOTE_CONDITION_NONE,
++	REMOTE_CONDITION_EQ, REMOTE_CONDITION_NE,
++	REMOTE_CONDITION_LT, REMOTE_CONDITION_LE,
++	REMOTE_CONDITION_GT, REMOTE_CONDITION_GE,
++	REMOTE_CONDITION_MASK_SET, REMOTE_CONDITION_MASK_CLEAR
++};
+ 
+ #define BPINT_ALL 0x100
+ 
+@@ -555,10 +625,24 @@ public:
+ 	void					SetAddress		(uint16_t seg, uint32_t off)	{ location = (PhysPt)GetAddress(seg,off); type = BKPNT_PHYSICAL; segment = seg; offset = off; };
+ 	void					SetAddress		(PhysPt adr)				{ location = adr; type = BKPNT_PHYSICAL; };
+ 	void					SetInt			(uint8_t _intNr, uint16_t ah, uint16_t al)	{ intNr = _intNr; ahValue = ah; alValue = al; type = BKPNT_INTERRUPT; };
++	void SetException(uint8_t vector, bool any_error, uint32_t error)
++	{
++		intNr = vector;
++		exceptionErrorAny = any_error;
++		exceptionError = error;
++		type = BKPNT_EXCEPTION;
++	}
+ 	void					SetOnce			(bool _once)				{ once = _once; };
+ 	void					SetType			(EBreakpoint _type)			{ type = _type; };
+ 	void					SetValue		(uint8_t value)				{ ahValue = value; };
+ 	void					SetOther		(uint8_t other)				{ alValue = other; };	
++	void SetRemoteCondition(ERemoteConditionRegister reg,
++	                        ERemoteConditionOperator op, uint32_t value)
++	{
++		conditionRegister = reg;
++		conditionOperator = op;
++		conditionValue = value;
++	}
+ 
+ 	bool					IsActive		(void)						{ return active; };
+ 	void					Activate		(bool _active);
+@@ -571,23 +655,33 @@ public:
+ 	uint8_t					GetIntNr		(void)						{ return intNr; };
+ 	uint16_t					GetValue		(void)						{ return ahValue; };
+ 	uint16_t					GetOther		(void)						{ return alValue; };
++	bool ExceptionErrorIsAny(void) const { return exceptionErrorAny; }
++	uint32_t GetExceptionError(void) const { return exceptionError; }
++	bool HasRemoteCondition(void) const { return conditionOperator != REMOTE_CONDITION_NONE; }
++	bool RemoteConditionMatches(void) const;
++	std::string RemoteConditionText(void) const;
+ 
+ 	// statics
+ 	static CBreakpoint*		AddBreakpoint		(uint16_t seg, uint32_t off, bool once);
+ 	static CBreakpoint*		AddIntBreakpoint	(uint8_t intNum, uint16_t ah, uint16_t al, bool once);
++	static CBreakpoint* AddExceptionBreakpoint(uint8_t vector, bool any_error,
++	                                           uint32_t error, bool once);
+ 	static CBreakpoint*		AddMemBreakpoint	(uint16_t seg, uint32_t off);
+ 	static void				DeactivateBreakpoints();
+ 	static void				ActivateBreakpoints	();
+ 	static void				ActivateBreakpointsExceptAt(PhysPt adr);
+ 	static bool				CheckBreakpoint		(uint16_t seg, uint32_t off);
+ 	static bool				CheckIntBreakpoint	(PhysPt adr, uint8_t intNr, uint16_t ahValue, uint16_t alValue);
++	static bool CheckExceptionBreakpoint(uint8_t vector, uint32_t error);
+ 	static CBreakpoint*		FindPhysBreakpoint	(uint16_t seg, uint32_t off, bool once);
++	static CBreakpoint*		FindMatchingPhysBreakpoint(uint16_t seg, uint32_t off, bool once);
+ 	static CBreakpoint*		FindOtherActiveBreakpoint(PhysPt adr, CBreakpoint* skip);
+ 	static bool				IsBreakpoint		(uint16_t seg, uint32_t off);
+ 	static bool				DeleteBreakpoint	(uint16_t seg, uint32_t off);
+ 	static bool				DeleteByIndex		(uint16_t index);
+ 	static void				DeleteAll			(void);
+ 	static void				ShowList			(void);
++	static std::string		RemoteList			(void);
+ 
+ 
+ private:
+@@ -603,9 +697,14 @@ private:
+ 	uint8_t		intNr;
+ 	uint16_t		ahValue;
+ 	uint16_t		alValue;
++	uint32_t exceptionError;
++	bool exceptionErrorAny;
+ 	// Shared
+ 	bool		active;
+ 	bool		once;
++	ERemoteConditionRegister conditionRegister;
++	ERemoteConditionOperator conditionOperator;
++	uint32_t conditionValue;
+ 
+ 	static std::list<CBreakpoint*>	BPoints;
+ #if C_HEAVY_DEBUG
+@@ -617,7 +716,133 @@ CBreakpoint::CBreakpoint(void):type(BKPNT_UNKNOWN),location(0),
+ #if !C_HEAVY_DEBUG
+ oldData(0xCC),
+ #endif
+-segment(0),offset(0),intNr(0),ahValue(0),alValue(0),active(false),once(false) { }
++segment(0),offset(0),intNr(0),ahValue(0),alValue(0),exceptionError(0),
++exceptionErrorAny(true),active(false),once(false),
++conditionRegister(REMOTE_REG_NONE),conditionOperator(REMOTE_CONDITION_NONE),
++conditionValue(0) { }
++
++static uint32_t RemoteConditionRegisterValue(ERemoteConditionRegister reg)
++{
++	switch (reg) {
++	case REMOTE_REG_EAX: return reg_eax;
++	case REMOTE_REG_EBX: return reg_ebx;
++	case REMOTE_REG_ECX: return reg_ecx;
++	case REMOTE_REG_EDX: return reg_edx;
++	case REMOTE_REG_ESI: return reg_esi;
++	case REMOTE_REG_EDI: return reg_edi;
++	case REMOTE_REG_EBP: return reg_ebp;
++	case REMOTE_REG_ESP: return reg_esp;
++	case REMOTE_REG_EIP: return reg_eip;
++	case REMOTE_REG_CS: return SegValue(cs);
++	case REMOTE_REG_SS: return SegValue(ss);
++	case REMOTE_REG_DS: return SegValue(ds);
++	case REMOTE_REG_ES: return SegValue(es);
++	case REMOTE_REG_FS: return SegValue(fs);
++	case REMOTE_REG_GS: return SegValue(gs);
++	case REMOTE_REG_FLAGS: return reg_flags;
++	case REMOTE_REG_AX: return reg_ax;
++	case REMOTE_REG_BX: return reg_bx;
++	case REMOTE_REG_CX: return reg_cx;
++	case REMOTE_REG_DX: return reg_dx;
++	case REMOTE_REG_SI: return reg_si;
++	case REMOTE_REG_DI: return reg_di;
++	case REMOTE_REG_BP: return reg_bp;
++	case REMOTE_REG_SP: return reg_sp;
++	case REMOTE_REG_IP: return reg_ip;
++	case REMOTE_REG_AH: return reg_ah;
++	case REMOTE_REG_AL: return reg_al;
++	case REMOTE_REG_BH: return reg_bh;
++	case REMOTE_REG_BL: return reg_bl;
++	case REMOTE_REG_CH: return reg_ch;
++	case REMOTE_REG_CL: return reg_cl;
++	case REMOTE_REG_DH: return reg_dh;
++	case REMOTE_REG_DL: return reg_dl;
++	default: return 0;
++	}
++}
++
++static const char *RemoteConditionRegisterName(ERemoteConditionRegister reg)
++{
++	switch (reg) {
++	case REMOTE_REG_EAX: return "EAX";
++	case REMOTE_REG_EBX: return "EBX";
++	case REMOTE_REG_ECX: return "ECX";
++	case REMOTE_REG_EDX: return "EDX";
++	case REMOTE_REG_ESI: return "ESI";
++	case REMOTE_REG_EDI: return "EDI";
++	case REMOTE_REG_EBP: return "EBP";
++	case REMOTE_REG_ESP: return "ESP";
++	case REMOTE_REG_EIP: return "EIP";
++	case REMOTE_REG_CS: return "CS";
++	case REMOTE_REG_SS: return "SS";
++	case REMOTE_REG_DS: return "DS";
++	case REMOTE_REG_ES: return "ES";
++	case REMOTE_REG_FS: return "FS";
++	case REMOTE_REG_GS: return "GS";
++	case REMOTE_REG_FLAGS: return "FLAGS";
++	case REMOTE_REG_AX: return "AX";
++	case REMOTE_REG_BX: return "BX";
++	case REMOTE_REG_CX: return "CX";
++	case REMOTE_REG_DX: return "DX";
++	case REMOTE_REG_SI: return "SI";
++	case REMOTE_REG_DI: return "DI";
++	case REMOTE_REG_BP: return "BP";
++	case REMOTE_REG_SP: return "SP";
++	case REMOTE_REG_IP: return "IP";
++	case REMOTE_REG_AH: return "AH";
++	case REMOTE_REG_AL: return "AL";
++	case REMOTE_REG_BH: return "BH";
++	case REMOTE_REG_BL: return "BL";
++	case REMOTE_REG_CH: return "CH";
++	case REMOTE_REG_CL: return "CL";
++	case REMOTE_REG_DH: return "DH";
++	case REMOTE_REG_DL: return "DL";
++	default: return "NONE";
++	}
++}
++
++static const char *RemoteConditionOperatorName(ERemoteConditionOperator op)
++{
++	switch (op) {
++	case REMOTE_CONDITION_EQ: return "EQ";
++	case REMOTE_CONDITION_NE: return "NE";
++	case REMOTE_CONDITION_LT: return "LT";
++	case REMOTE_CONDITION_LE: return "LE";
++	case REMOTE_CONDITION_GT: return "GT";
++	case REMOTE_CONDITION_GE: return "GE";
++	case REMOTE_CONDITION_MASK_SET: return "MASK_SET";
++	case REMOTE_CONDITION_MASK_CLEAR: return "MASK_CLEAR";
++	default: return "NONE";
++	}
++}
++
++bool CBreakpoint::RemoteConditionMatches(void) const
++{
++	if (!HasRemoteCondition()) return true;
++	const uint32_t actual = RemoteConditionRegisterValue(conditionRegister);
++	switch (conditionOperator) {
++	case REMOTE_CONDITION_EQ: return actual == conditionValue;
++	case REMOTE_CONDITION_NE: return actual != conditionValue;
++	case REMOTE_CONDITION_LT: return actual < conditionValue;
++	case REMOTE_CONDITION_LE: return actual <= conditionValue;
++	case REMOTE_CONDITION_GT: return actual > conditionValue;
++	case REMOTE_CONDITION_GE: return actual >= conditionValue;
++	case REMOTE_CONDITION_MASK_SET: return (actual & conditionValue) != 0;
++	case REMOTE_CONDITION_MASK_CLEAR: return (actual & conditionValue) == 0;
++	default: return false;
++	}
++}
++
++std::string CBreakpoint::RemoteConditionText(void) const
++{
++	if (!HasRemoteCondition()) return std::string();
++	std::ostringstream out;
++	out << ":IF:" << RemoteConditionRegisterName(conditionRegister)
++	    << ":" << RemoteConditionOperatorName(conditionOperator)
++	    << ":" << std::hex << std::uppercase << std::setfill('0')
++	    << std::setw(8) << conditionValue;
++	return out.str();
++}
+ 
+ void CBreakpoint::Activate(bool _active)
+ {
+@@ -680,6 +905,16 @@ CBreakpoint* CBreakpoint::AddIntBreakpoint(uint8_t intNum, uint16_t ah, uint16_t
+ 	return bp;
+ }
+ 
++CBreakpoint* CBreakpoint::AddExceptionBreakpoint(uint8_t vector, bool any_error,
++                                                 uint32_t error, bool once)
++{
++	CBreakpoint* bp = new CBreakpoint();
++	bp->SetException(vector, any_error, error);
++	bp->SetOnce(once);
++	BPoints.push_front(bp);
++	return bp;
++}
++
+ CBreakpoint* CBreakpoint::AddMemBreakpoint(uint16_t seg, uint32_t off)
+ {
+ 	CBreakpoint* bp = new CBreakpoint();
+@@ -730,7 +965,8 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
+ 		CBreakpoint *bp = (*i);
+ 
+ 		if ((bp->GetType() == BKPNT_PHYSICAL) && bp->IsActive() &&
+-		    (bp->GetLocation() == GetAddress(seg, off))) {
++		    (bp->GetLocation() == GetAddress(seg, off)) &&
++		    bp->RemoteConditionMatches()) {
+ 			// Found
+ 			if (bp->GetOnce()) {
+ 				// delete it, if it should only be used once
+@@ -739,7 +975,7 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
+ 				delete bp;
+ 			} else {
+ 				// Also look for once-only breakpoints at this address
+-				bp = FindPhysBreakpoint(seg, off, true);
++				bp = FindMatchingPhysBreakpoint(seg, off, true);
+ 				if (bp) {
+ 					BPoints.remove(bp);
+ 					bp->Activate(false);
+@@ -813,6 +1049,24 @@ bool CBreakpoint::CheckIntBreakpoint(PhysPt adr, uint8_t intNr, uint16_t ahValue
+ 	return false;
+ }
+ 
++bool CBreakpoint::CheckExceptionBreakpoint(uint8_t vector, uint32_t error)
++{
++	for (auto i = BPoints.begin(); i != BPoints.end(); ++i) {
++		CBreakpoint* bp = *i;
++		if (bp->GetType() != BKPNT_EXCEPTION || !bp->IsActive() ||
++		    bp->GetIntNr() != vector ||
++		    (!bp->ExceptionErrorIsAny() && bp->GetExceptionError() != error))
++			continue;
++		if (bp->GetOnce()) {
++			(BPoints.erase)(i);
++			bp->Activate(false);
++			delete bp;
++		}
++		return true;
++	}
++	return false;
++}
++
+ void CBreakpoint::DeleteAll()
+ {
+ 	std::list<CBreakpoint*>::iterator i;
+@@ -870,6 +1124,26 @@ CBreakpoint* CBreakpoint::FindPhysBreakpoint(uint16_t seg, uint32_t off, bool on
+ 	return nullptr;
+ }
+ 
++CBreakpoint* CBreakpoint::FindMatchingPhysBreakpoint(uint16_t seg, uint32_t off,
++                                                     bool once)
++{
++	if (BPoints.empty()) return nullptr;
++#if !C_HEAVY_DEBUG
++	const PhysPt address = GetAddress(seg, off);
++#endif
++	for (auto bp : BPoints) {
++#if C_HEAVY_DEBUG
++		const bool at_location = bp->GetSegment() == seg && bp->GetOffset() == off;
++#else
++		const bool at_location = bp->GetLocation() == address;
++#endif
++		if (bp->GetType() == BKPNT_PHYSICAL && at_location &&
++		    bp->GetOnce() == once && bp->RemoteConditionMatches())
++			return bp;
++	}
++	return nullptr;
++}
++
+ CBreakpoint* CBreakpoint::FindOtherActiveBreakpoint(PhysPt adr, CBreakpoint* skip)
+ {
+ 	std::list<CBreakpoint*>::iterator i;
+@@ -913,6 +1187,12 @@ void CBreakpoint::ShowList(void)
+ 			if (bp->GetValue()==BPINT_ALL) DEBUG_ShowMsg("%02X. BPINT %02X\n",nr,bp->GetIntNr());
+ 			else if (bp->GetOther()==BPINT_ALL) DEBUG_ShowMsg("%02X. BPINT %02X AH=%02X\n",nr,bp->GetIntNr(),bp->GetValue());
+ 			else DEBUG_ShowMsg("%02X. BPINT %02X AH=%02X AL=%02X\n",nr,bp->GetIntNr(),bp->GetValue(),bp->GetOther());
++		} else if (bp->GetType()==BKPNT_EXCEPTION) {
++			if (bp->ExceptionErrorIsAny())
++				DEBUG_ShowMsg("%02X. BPEX %02X\n",nr,bp->GetIntNr());
++			else
++				DEBUG_ShowMsg("%02X. BPEX %02X ERROR=%08X\n",nr,bp->GetIntNr(),
++				              bp->GetExceptionError());
+ 		} else if (bp->GetType()==BKPNT_MEMORY) {
+ 			DEBUG_ShowMsg("%02X. BPMEM %04X:%04X (%02X)\n",nr,bp->GetSegment(),bp->GetOffset(),bp->GetValue());
+ 		} else if (bp->GetType()==BKPNT_MEMORY_PROT) {
+@@ -926,6 +1206,56 @@ void CBreakpoint::ShowList(void)
+ 	}
+ }
+ 
++std::string CBreakpoint::RemoteList(void)
++{
++	std::ostringstream out;
++	unsigned int index = 0;
++	for (auto bp : BPoints) {
++		if (index) out << ";";
++		out << index++ << ":";
++		switch (bp->GetType()) {
++		case BKPNT_PHYSICAL:
++			out << "EXEC:" << std::hex << std::uppercase << std::setfill('0')
++			    << std::setw(4) << bp->GetSegment() << ":"
++			    << std::setw(8) << bp->GetOffset();
++			break;
++		case BKPNT_INTERRUPT:
++			out << "INT:" << std::hex << std::uppercase << std::setfill('0')
++			    << std::setw(2) << static_cast<unsigned int>(bp->GetIntNr())
++			    << ":AH=";
++			if (bp->GetValue() == BPINT_ALL) out << "ANY";
++			else out << std::setw(2) << bp->GetValue();
++			out << ":AL=";
++			if (bp->GetOther() == BPINT_ALL) out << "ANY";
++			else out << std::setw(2) << bp->GetOther();
++			break;
++		case BKPNT_EXCEPTION:
++			out << "EXCEPTION:" << std::hex << std::uppercase << std::setfill('0')
++			    << std::setw(2) << static_cast<unsigned int>(bp->GetIntNr())
++			    << ":ERROR=";
++			if (bp->ExceptionErrorIsAny()) out << "ANY";
++			else out << std::setw(8) << bp->GetExceptionError();
++			break;
++		case BKPNT_MEMORY_PROT:
++			out << "CHANGE_PROT:" << std::hex << std::uppercase << std::setfill('0')
++			    << std::setw(4) << bp->GetSegment() << ":"
++			    << std::setw(8) << bp->GetOffset();
++			break;
++		case BKPNT_MEMORY_LINEAR:
++			out << "CHANGE_LINEAR:" << std::hex << std::uppercase
++			    << std::setfill('0') << std::setw(8) << bp->GetOffset();
++			break;
++		default:
++			out << "TYPE" << static_cast<int>(bp->GetType());
++			break;
++		}
++		out << ":" << (bp->IsActive() ? "ACTIVE" : "INACTIVE")
++		    << (bp->GetOnce() ? ":ONCE" : "")
++		    << bp->RemoteConditionText();
++	}
++	return index ? out.str() : std::string("EMPTY");
++}
++
+ bool DEBUG_Breakpoint(void)
+ {
+ 	if (inhibit_int_breakpoint) return false; /* or else stepping over INT 21h when BPINT 21h does nothing */
+@@ -944,10 +1274,29 @@ bool DEBUG_IntBreakpoint(uint8_t intNum)
+ 	PhysPt where=(PhysPt)GetAddress(SegValue(cs),reg_eip);
+ 	if (!CBreakpoint::CheckIntBreakpoint(where,intNum,reg_ah,reg_al)) return false;
+ 	// Found. Breakpoint is valid
++	if (remote_debug_enabled.load())
++		remote_debug_stop_reason.store(REMOTE_STOP_INTERRUPT);
+ 	CBreakpoint::DeactivateBreakpoints();	// Deactivate all breakpoints
+ 	return true;
+ }
+ 
++bool DEBUG_ExceptionBreakpoint(Bitu which, Bitu error)
++{
++	if (inhibit_exception_breakpoint || !remote_debug_enabled.load() || which >= 0x20)
++		return false;
++	if (!CBreakpoint::CheckExceptionBreakpoint(static_cast<uint8_t>(which),
++	                                           static_cast<uint32_t>(error)))
++		return false;
++	remote_exception_vector.store(static_cast<unsigned int>(which));
++	remote_exception_error.store(static_cast<uint32_t>(error));
++	remote_debug_stop_reason.store(REMOTE_STOP_EXCEPTION);
++	remote_exception_pending.store(true);
++	/* End the current normal-core budget. Dynamic cores return through their
++	 * exception path and check the pending stop immediately. */
++	CPU_Cycles = 0;
++	return true;
++}
++
+ static bool StepOver()
+ {
+ 	exitLoop = false;
+@@ -4307,6 +4656,657 @@ int32_t DEBUG_Run(int32_t amount,bool quickexit) {
+ 	return ret;
+ }
+ 
++static bool RemoteParseHex(const std::string &text, uint32_t &value)
++{
++	if (text.empty()) return false;
++	char *end = NULL;
++	unsigned long parsed = strtoul(text.c_str(), &end, 16);
++	if (!end || *end != '\0' || parsed > 0xffffffffUL) return false;
++	value = static_cast<uint32_t>(parsed);
++	return true;
++}
++
++static bool RemoteParseInterruptFilter(std::string text, uint16_t &value)
++{
++	for (auto &ch : text) ch = static_cast<char>(toupper(ch));
++	if (text.empty() || text == "ANY") {
++		value = BPINT_ALL;
++		return true;
++	}
++	uint32_t parsed = 0;
++	if (!RemoteParseHex(text, parsed) || parsed > 0xffU) return false;
++	value = static_cast<uint16_t>(parsed);
++	return true;
++}
++
++static ERemoteConditionRegister RemoteParseConditionRegister(std::string text)
++{
++	for (auto &ch : text) ch = static_cast<char>(toupper(ch));
++#define REMOTE_REGISTER(name) if (text == #name) return REMOTE_REG_##name
++	REMOTE_REGISTER(EAX); REMOTE_REGISTER(EBX); REMOTE_REGISTER(ECX); REMOTE_REGISTER(EDX);
++	REMOTE_REGISTER(ESI); REMOTE_REGISTER(EDI); REMOTE_REGISTER(EBP); REMOTE_REGISTER(ESP);
++	REMOTE_REGISTER(EIP); REMOTE_REGISTER(CS); REMOTE_REGISTER(SS); REMOTE_REGISTER(DS);
++	REMOTE_REGISTER(ES); REMOTE_REGISTER(FS); REMOTE_REGISTER(GS); REMOTE_REGISTER(FLAGS);
++	REMOTE_REGISTER(AX); REMOTE_REGISTER(BX); REMOTE_REGISTER(CX); REMOTE_REGISTER(DX);
++	REMOTE_REGISTER(SI); REMOTE_REGISTER(DI); REMOTE_REGISTER(BP); REMOTE_REGISTER(SP);
++	REMOTE_REGISTER(IP); REMOTE_REGISTER(AH); REMOTE_REGISTER(AL); REMOTE_REGISTER(BH);
++	REMOTE_REGISTER(BL); REMOTE_REGISTER(CH); REMOTE_REGISTER(CL); REMOTE_REGISTER(DH);
++	REMOTE_REGISTER(DL);
++#undef REMOTE_REGISTER
++	return REMOTE_REG_NONE;
++}
++
++static ERemoteConditionOperator RemoteParseConditionOperator(std::string text)
++{
++	for (auto &ch : text) ch = static_cast<char>(toupper(ch));
++	if (text == "=" || text == "==" || text == "EQ") return REMOTE_CONDITION_EQ;
++	if (text == "!=" || text == "NE") return REMOTE_CONDITION_NE;
++	if (text == "<" || text == "LT") return REMOTE_CONDITION_LT;
++	if (text == "<=" || text == "LE") return REMOTE_CONDITION_LE;
++	if (text == ">" || text == "GT") return REMOTE_CONDITION_GT;
++	if (text == ">=" || text == "GE") return REMOTE_CONDITION_GE;
++	if (text == "&" || text == "MASK_SET") return REMOTE_CONDITION_MASK_SET;
++	if (text == "!&" || text == "MASK_CLEAR") return REMOTE_CONDITION_MASK_CLEAR;
++	return REMOTE_CONDITION_NONE;
++}
++
++static bool RemoteParseAddress(const std::string &text, uint16_t &segment,
++                               uint32_t &offset)
++{
++	const std::string::size_type colon = text.find(':');
++	if (colon == std::string::npos) return false;
++	uint32_t parsed_segment = 0;
++	if (!RemoteParseHex(text.substr(0, colon), parsed_segment) ||
++	    parsed_segment > 0xffffU ||
++	    !RemoteParseHex(text.substr(colon + 1), offset)) return false;
++	segment = static_cast<uint16_t>(parsed_segment);
++	return true;
++}
++
++static std::string RemoteRegisterState(void)
++{
++	std::ostringstream out;
++	out << std::hex << std::uppercase << std::setfill('0')
++	    << "OK STOPPED=" << (remote_debug_stopped.load() ? 1 : 0)
++	    << " REASON=" << RemoteStopReasonName()
++	    << " CORE=" << (CPU_IsDynamicCore() ? "DYNAMIC" : "NORMAL")
++	    << " EAX=" << std::setw(8) << reg_eax
++	    << " EBX=" << std::setw(8) << reg_ebx
++	    << " ECX=" << std::setw(8) << reg_ecx
++	    << " EDX=" << std::setw(8) << reg_edx
++	    << " ESI=" << std::setw(8) << reg_esi
++	    << " EDI=" << std::setw(8) << reg_edi
++	    << " EBP=" << std::setw(8) << reg_ebp
++	    << " ESP=" << std::setw(8) << reg_esp
++	    << " CS=" << std::setw(4) << SegValue(cs)
++	    << " EIP=" << std::setw(8) << reg_eip
++	    << " SS=" << std::setw(4) << SegValue(ss)
++	    << " DS=" << std::setw(4) << SegValue(ds)
++	    << " ES=" << std::setw(4) << SegValue(es)
++	    << " FS=" << std::setw(4) << SegValue(fs)
++	    << " GS=" << std::setw(4) << SegValue(gs)
++	    << " FLAGS=" << std::setw(8) << reg_flags;
++	if (remote_debug_stop_reason.load() == REMOTE_STOP_EXCEPTION)
++		out << " EXCEPTION=" << std::setw(2) << remote_exception_vector.load()
++		    << " ERROR=" << std::setw(8) << remote_exception_error.load();
++	return out.str();
++}
++
++static std::string RemoteReadMemory(uint64_t address, uint32_t count)
++{
++	if (address == mem_no_address) return "ERR INVALID_ADDRESS";
++	if (!count || count > 512U) return "ERR COUNT_RANGE_1_512";
++	std::ostringstream out;
++	out << "OK" << std::hex << std::uppercase << std::setfill('0');
++	for (uint32_t i = 0; i < count; ++i) {
++		uint8_t value = 0;
++		if (mem_readb_checked(static_cast<PhysPt>(address + i), &value))
++			return "ERR MEMORY_READ";
++		out << " " << std::setw(2) << static_cast<unsigned int>(value);
++	}
++	return out.str();
++}
++
++static std::string RemoteDisassemble(uint16_t segment, uint32_t offset,
++                                     uint32_t count)
++{
++	if (!count || count > 32U) return "ERR COUNT_RANGE_1_32";
++	std::ostringstream out;
++	out << std::hex << std::uppercase << std::setfill('0');
++	for (uint32_t i = 0; i < count; ++i) {
++		const uint64_t address = GetAddress(segment, offset);
++		if (address == mem_no_address) return "ERR INVALID_ADDRESS";
++		char line[200];
++		const Bitu size = DasmI386(line, static_cast<PhysPt>(address), offset,
++		                           cpu.code.big);
++		if (!size) return "ERR DISASSEMBLY";
++		if (i) out << "\n";
++		out << (i ? "   " : "OK ") << std::setw(4) << segment << ":"
++		    << std::setw(8) << offset << " " << line;
++		offset += static_cast<uint32_t>(size);
++	}
++	return out.str();
++}
++
++static bool RemoteReadSelectorWord(uint16_t selector, uint32_t offset,
++                                   uint16_t &value)
++{
++	if (offset >= 0xffffU) return false;
++	const uint64_t first = GetAddress(selector, offset);
++	const uint64_t last = GetAddress(selector, offset + 1U);
++	if (first == mem_no_address || last == mem_no_address || last != first + 1U)
++		return false;
++	return !mem_readw_checked(static_cast<PhysPt>(first), &value);
++}
++
++static std::string RemoteWin16Stack(uint32_t count)
++{
++	if (!count || count > 64U) return "ERR STACK_COUNT_RANGE_1_64";
++	if (cpu.stack.big) return "ERR STACK_REQUIRES_16BIT_STACK";
++
++	const uint16_t stack_selector = SegValue(ss);
++	uint16_t frame_bp = reg_bp;
++	uint16_t frame_cs = SegValue(cs);
++	uint32_t frame_ip = reg_eip;
++	std::set<uint16_t> visited;
++	std::string end_reason = "LIMIT";
++	std::ostringstream out;
++	out << std::hex << std::uppercase << std::setfill('0')
++	    << "OK 0:CURRENT:" << std::setw(4) << frame_cs << ":"
++	    << std::setw(8) << frame_ip << ":SS=" << std::setw(4) << stack_selector
++	    << ":BP=" << std::setw(4) << frame_bp;
++
++	for (uint32_t index = 1; index < count; ++index) {
++		if (!frame_bp) {
++			end_reason = "ZERO_BP";
++			break;
++		}
++		if (!visited.insert(frame_bp).second) {
++			end_reason = "CYCLE";
++			break;
++		}
++		/* Saved BP and return IP occupy four bytes even for a near frame. */
++		if (frame_bp > 0xfffcU) {
++			end_reason = "FRAME_RANGE";
++			break;
++		}
++		uint16_t saved_bp = 0;
++		uint16_t return_ip = 0;
++		uint16_t return_cs = frame_cs;
++		if (!RemoteReadSelectorWord(stack_selector, frame_bp, saved_bp) ||
++		    !RemoteReadSelectorWord(stack_selector, frame_bp + 2U, return_ip)) {
++			end_reason = "UNREADABLE";
++			break;
++		}
++		const bool far_frame = (saved_bp & 1U) != 0;
++		if (far_frame) {
++			if (frame_bp > 0xfffaU) {
++				end_reason = "FRAME_RANGE";
++				break;
++			}
++			if (!RemoteReadSelectorWord(stack_selector, frame_bp + 4U, return_cs)) {
++				end_reason = "UNREADABLE";
++				break;
++			}
++		}
++		const uint16_t parent_bp = far_frame ?
++		                           static_cast<uint16_t>(saved_bp - 1U) : saved_bp;
++		out << ";" << std::dec << index << std::hex << ":RETURN:"
++		    << std::setw(4) << return_cs << ":" << std::setw(8) << return_ip
++		    << ":SS=" << std::setw(4) << stack_selector
++		    << ":BP=" << std::setw(4) << parent_bp
++		    << ":VIA=" << (far_frame ? "FAR" : "NEAR");
++		frame_bp = parent_bp;
++		frame_cs = return_cs;
++	}
++
++	out << " END=" << end_reason;
++	return out.str();
++}
++
++static void RemoteStepOneInstruction(bool inhibit_events = false)
++{
++	/* Dynamic cores execute translated blocks even when given a one-cycle
++	 * budget. Use the normal decoder for this one instruction, then restore the
++	 * configured decoder so execution between debugger stops remains fast. */
++	CPU_Decoder *configured_decoder = cpudecoder;
++	if (CPU_IsDynamicCore()) cpudecoder = &CPU_Core_Normal_Run;
++	exitLoop = false;
++	mustCompleteInstruction = true;
++	inhibit_int_breakpoint = inhibit_events;
++	inhibit_exception_breakpoint = inhibit_events;
++	DEBUG_Run(1, true);
++	inhibit_exception_breakpoint = false;
++	inhibit_int_breakpoint = false;
++	mustCompleteInstruction = false;
++	cpudecoder = configured_decoder;
++}
++
++static std::string RemoteExecuteCommand(const std::string &request,
++                                        bool &resume)
++{
++	resume = false;
++	std::istringstream input(request);
++	std::string command;
++	input >> command;
++	for (auto &ch : command) ch = static_cast<char>(toupper(ch));
++
++	if (command == "REGISTERS") return RemoteRegisterState();
++
++	if (command == "SELECTOR") {
++		std::string token;
++		uint32_t selector_value = 0;
++		input >> token;
++		if (!RemoteParseHex(token, selector_value) || selector_value > 0xffffU)
++			return "ERR USAGE DEBUG SELECTOR <selector>";
++		Descriptor descriptor;
++		if (!cpu.gdt.GetDescriptor(static_cast<uint16_t>(selector_value), descriptor))
++			return "ERR INVALID_SELECTOR";
++		std::ostringstream out;
++		out << std::hex << std::uppercase << std::setfill('0')
++		    << "OK SELECTOR=" << std::setw(4) << selector_value
++		    << " BASE=" << std::setw(8) << descriptor.GetBase()
++		    << " LIMIT=" << std::setw(8) << descriptor.GetLimit()
++		    << " TYPE=" << std::setw(2) << descriptor.Type()
++		    << " DPL=" << descriptor.DPL()
++		    << " BIG=" << descriptor.Big();
++		return out.str();
++	}
++
++	if (command == "MEMORY") {
++		std::string mode, address_text, count_text;
++		input >> mode >> address_text >> count_text;
++		for (auto &ch : mode) ch = static_cast<char>(toupper(ch));
++		uint32_t count = 0;
++		if (!RemoteParseHex(count_text, count))
++			return "ERR USAGE DEBUG MEMORY READ <selector:offset> <hex-count>";
++		if (mode == "READ") {
++			uint16_t segment = 0;
++			uint32_t offset = 0;
++			if (!RemoteParseAddress(address_text, segment, offset))
++				return "ERR INVALID_ADDRESS";
++			return RemoteReadMemory(GetAddress(segment, offset), count);
++		}
++		if (mode == "LINEAR") {
++			uint32_t address = 0;
++			if (!RemoteParseHex(address_text, address)) return "ERR INVALID_ADDRESS";
++			return RemoteReadMemory(address, count);
++		}
++		return "ERR USAGE DEBUG MEMORY (READ|LINEAR) <address> <hex-count>";
++	}
++
++	if (command == "DISASM") {
++		std::string address_text, count_text;
++		input >> address_text >> count_text;
++		uint16_t segment = SegValue(cs);
++		uint32_t offset = reg_eip;
++		uint32_t count = 8;
++		if (!address_text.empty() &&
++		    !RemoteParseAddress(address_text, segment, offset))
++			return "ERR INVALID_ADDRESS";
++		if (!count_text.empty() && !RemoteParseHex(count_text, count))
++			return "ERR INVALID_COUNT";
++		return RemoteDisassemble(segment, offset, count);
++	}
++
++	if (command == "STACK") {
++		std::string count_text, extra;
++		input >> count_text >> extra;
++		if (!extra.empty()) return "ERR USAGE DEBUG STACK [decimal-count]";
++		uint32_t count = 16;
++		if (!count_text.empty()) {
++			char *end = NULL;
++			const unsigned long parsed = strtoul(count_text.c_str(), &end, 10);
++			if (!end || *end != '\0' || parsed < 1 || parsed > 64)
++				return "ERR STACK_COUNT_RANGE_1_64";
++			count = static_cast<uint32_t>(parsed);
++		}
++		return RemoteWin16Stack(count);
++	}
++
++	if (command == "INTERRUPT") {
++		std::string action, vector_text, ah_text, al_text, option, extra;
++		input >> action >> vector_text >> ah_text >> al_text >> option >> extra;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "LIST") return "OK " + CBreakpoint::RemoteList();
++		if (action == "CLEAR") {
++			CBreakpoint::DeleteAll();
++			return "OK CLEARED";
++		}
++		if (action != "ADD")
++			return "ERR USAGE DEBUG INTERRUPT ADD <hex-vector> [<hex-ah|ANY> [<hex-al|ANY>]] [ONCE]";
++
++		uint32_t vector = 0;
++		if (!RemoteParseHex(vector_text, vector) || vector > 0xffU)
++			return "ERR INVALID_INTERRUPT_VECTOR";
++		bool once = false;
++		for (auto &ch : ah_text) ch = static_cast<char>(toupper(ch));
++		for (auto &ch : al_text) ch = static_cast<char>(toupper(ch));
++		for (auto &ch : option) ch = static_cast<char>(toupper(ch));
++		if (ah_text == "ONCE") {
++			once = true;
++			ah_text.clear();
++		} else if (al_text == "ONCE") {
++			once = true;
++			al_text.clear();
++		} else if (option == "ONCE") {
++			once = true;
++			option.clear();
++		}
++		if (!option.empty() || !extra.empty())
++			return "ERR USAGE DEBUG INTERRUPT ADD <hex-vector> [<hex-ah|ANY> [<hex-al|ANY>]] [ONCE]";
++		uint16_t ah_filter = BPINT_ALL;
++		uint16_t al_filter = BPINT_ALL;
++		if (!RemoteParseInterruptFilter(ah_text, ah_filter) ||
++		    !RemoteParseInterruptFilter(al_text, al_filter))
++			return "ERR INVALID_INTERRUPT_FILTER";
++		CBreakpoint::AddIntBreakpoint(static_cast<uint8_t>(vector), ah_filter,
++		                               al_filter, once);
++		return "OK ADDED";
++	}
++
++	if (command == "EXCEPTION") {
++		std::string action, vector_text, error_text, option, extra;
++		input >> action >> vector_text >> error_text >> option >> extra;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "LIST") return "OK " + CBreakpoint::RemoteList();
++		if (action == "CLEAR") {
++			CBreakpoint::DeleteAll();
++			return "OK CLEARED";
++		}
++		if (action != "ADD")
++			return "ERR USAGE DEBUG EXCEPTION ADD <hex-vector> [<hex-error|ANY>] [ONCE]";
++
++		uint32_t vector = 0;
++		if (!RemoteParseHex(vector_text, vector) || vector >= 0x20U)
++			return "ERR INVALID_EXCEPTION_VECTOR";
++		for (auto &ch : error_text) ch = static_cast<char>(toupper(ch));
++		for (auto &ch : option) ch = static_cast<char>(toupper(ch));
++		bool once = false;
++		if (error_text == "ONCE") {
++			once = true;
++			error_text.clear();
++		} else if (option == "ONCE") {
++			once = true;
++			option.clear();
++		}
++		if (!option.empty() || !extra.empty())
++			return "ERR USAGE DEBUG EXCEPTION ADD <hex-vector> [<hex-error|ANY>] [ONCE]";
++		bool any_error = error_text.empty() || error_text == "ANY";
++		uint32_t error = 0;
++		if (!any_error && !RemoteParseHex(error_text, error))
++			return "ERR INVALID_EXCEPTION_ERROR";
++		CBreakpoint::AddExceptionBreakpoint(static_cast<uint8_t>(vector),
++		                                    any_error, error, once);
++		return "OK ADDED";
++	}
++
++	if (command == "BREAK") {
++		std::string action, address_text;
++		input >> action >> address_text;
++		for (auto &ch : action) ch = static_cast<char>(toupper(ch));
++		if (action == "LIST") return "OK " + CBreakpoint::RemoteList();
++		if (action == "CLEAR") {
++			CBreakpoint::DeleteAll();
++			return "OK CLEARED";
++		}
++		uint16_t segment = 0;
++		uint32_t offset = 0;
++		if (!RemoteParseAddress(address_text, segment, offset))
++			return "ERR INVALID_ADDRESS";
++		if (action == "ADD") {
++			std::vector<std::string> options;
++			std::string option;
++			while (input >> option) options.push_back(option);
++			size_t index = 0;
++			bool once = false;
++			if (index < options.size()) {
++				std::string keyword = options[index];
++				for (auto &ch : keyword) ch = static_cast<char>(toupper(ch));
++				if (keyword == "ONCE") {
++					once = true;
++					++index;
++				}
++			}
++
++			ERemoteConditionRegister condition_register = REMOTE_REG_NONE;
++			ERemoteConditionOperator condition_operator = REMOTE_CONDITION_NONE;
++			uint32_t condition_value = 0;
++			if (index < options.size()) {
++				std::string keyword = options[index++];
++				for (auto &ch : keyword) ch = static_cast<char>(toupper(ch));
++				if (keyword != "IF" || options.size() - index != 3)
++					return "ERR USAGE DEBUG BREAK ADD <selector:offset> [ONCE] [IF <register> <operator> <hex-value>]";
++				condition_register = RemoteParseConditionRegister(options[index++]);
++				condition_operator = RemoteParseConditionOperator(options[index++]);
++				if (condition_register == REMOTE_REG_NONE)
++					return "ERR INVALID_CONDITION_REGISTER";
++				if (condition_operator == REMOTE_CONDITION_NONE)
++					return "ERR INVALID_CONDITION_OPERATOR";
++				if (!RemoteParseHex(options[index++], condition_value))
++					return "ERR INVALID_CONDITION_VALUE";
++			}
++			if (index != options.size())
++				return "ERR USAGE DEBUG BREAK ADD <selector:offset> [ONCE] [IF <register> <operator> <hex-value>]";
++
++			CBreakpoint *breakpoint = CBreakpoint::AddBreakpoint(segment, offset, once);
++			if (condition_operator != REMOTE_CONDITION_NONE)
++				breakpoint->SetRemoteCondition(condition_register, condition_operator,
++				                               condition_value);
++			return "OK ADDED";
++		}
++		if (action == "DELETE")
++			return CBreakpoint::DeleteBreakpoint(segment, offset) ?
++			       "OK DELETED" : "ERR NOT_FOUND";
++		return "ERR USAGE DEBUG BREAK (ADD|DELETE|LIST|CLEAR)";
++	}
++
++	if (command == "STEP") {
++		std::string count_text;
++		input >> count_text;
++		uint32_t count = 1;
++		if (!count_text.empty()) {
++			char *end = NULL;
++			unsigned long parsed = strtoul(count_text.c_str(), &end, 10);
++			if (!end || *end != '\0' || parsed < 1 || parsed > 10000)
++				return "ERR COUNT_RANGE_1_10000";
++			count = static_cast<uint32_t>(parsed);
++		}
++		for (uint32_t i = 0; i < count; ++i) {
++			RemoteStepOneInstruction();
++		}
++		remote_debug_stop_reason.store(REMOTE_STOP_STEP);
++		return RemoteRegisterState();
++	}
++
++	if (command == "FINISH") {
++		std::string limit_text;
++		input >> limit_text;
++		uint32_t instruction_limit = 1000000;
++		if (!limit_text.empty()) {
++			char *end = NULL;
++			unsigned long parsed = strtoul(limit_text.c_str(), &end, 10);
++			if (!end || *end != '\0' || parsed < 1 || parsed > 10000000)
++				return "ERR FINISH_LIMIT_RANGE_1_10000000";
++			instruction_limit = static_cast<uint32_t>(parsed);
++		}
++
++		uint32_t nested_depth = 0;
++		for (uint32_t executed = 0; executed < instruction_limit; ++executed) {
++			const uint64_t address = GetAddress(SegValue(cs), reg_eip);
++			if (address == mem_no_address) return "ERR INVALID_ADDRESS";
++			char line[200];
++			DasmI386(line, static_cast<PhysPt>(address), reg_eip, cpu.code.big);
++			std::string instruction(line);
++			for (auto &ch : instruction) ch = static_cast<char>(tolower(ch));
++			const std::string mnemonic = instruction.substr(0, instruction.find(' '));
++			const bool enters_frame = mnemonic.compare(0, 4, "call") == 0 ||
++			                          mnemonic.compare(0, 3, "int") == 0;
++			const bool leaves_frame = mnemonic.compare(0, 3, "ret") == 0 ||
++			                          mnemonic.compare(0, 4, "iret") == 0;
++
++			if (enters_frame) ++nested_depth;
++			RemoteStepOneInstruction();
++			if (leaves_frame) {
++				if (nested_depth == 0) {
++					remote_debug_stop_reason.store(REMOTE_STOP_FINISH);
++					return RemoteRegisterState();
++				}
++				--nested_depth;
++			}
++		}
++		return "ERR FINISH_INSTRUCTION_LIMIT";
++	}
++
++	if (command == "NEXT" || command == "RUN") {
++		std::string subcommand, address_text;
++		if (command == "RUN") {
++			input >> subcommand >> address_text;
++			for (auto &ch : subcommand) ch = static_cast<char>(toupper(ch));
++			if (subcommand != "UNTIL")
++				return "ERR USAGE DEBUG RUN UNTIL <selector:offset>";
++			uint16_t segment = 0;
++			uint32_t offset = 0;
++			if (!RemoteParseAddress(address_text, segment, offset))
++				return "ERR INVALID_ADDRESS";
++			CBreakpoint::AddBreakpoint(segment, offset, true);
++		} else {
++			const PhysPt start = static_cast<PhysPt>(GetAddress(SegValue(cs), reg_eip));
++			char line[200];
++			const Bitu size = DasmI386(line, start, reg_eip, cpu.code.big);
++			std::string disassembly(line);
++			for (auto &ch : disassembly) ch = static_cast<char>(tolower(ch));
++			if (disassembly.find("call") != std::string::npos ||
++			    disassembly.find("int") != std::string::npos ||
++			    disassembly.find("loop") != std::string::npos ||
++			    disassembly.find("rep") != std::string::npos) {
++				CBreakpoint::AddBreakpoint(SegValue(cs), reg_eip + size, true);
++			} else {
++				RemoteStepOneInstruction();
++				remote_debug_stop_reason.store(REMOTE_STOP_NEXT);
++				return RemoteRegisterState();
++			}
++		}
++		command = "CONTINUE";
++	}
++
++	if (command == "CONTINUE") {
++		const int previous_reason = remote_debug_stop_reason.load();
++		const bool resuming_event = previous_reason == REMOTE_STOP_INTERRUPT ||
++		                            previous_reason == REMOTE_STOP_EXCEPTION;
++		remote_debug_stop_reason.store(REMOTE_STOP_RUNNING);
++		remote_debug_stopped.store(false);
++		/* Keep every other breakpoint active during the instruction that leaves
++		 * the current stop. Only the physical breakpoint at the current address
++		 * must stay disabled, and only a stopped event needs one-shot event
++		 * inhibition to avoid immediately reporting itself again. */
++		CBreakpoint::ActivateBreakpointsExceptAt(
++		        static_cast<PhysPt>(GetAddress(SegValue(cs), reg_eip)));
++		RemoteStepOneInstruction(resuming_event);
++		CBreakpoint::ActivateBreakpoints();
++		DOSBOX_SetNormalLoop();
++		resume = true;
++		return "OK RUNNING";
++	}
++
++	return "ERR UNKNOWN_DEBUG_COMMAND";
++}
++
++static Bitu RemoteDebuggerLoop(void)
++{
++	CBreakpoint::DeactivateBreakpoints();
++	{
++		std::lock_guard<std::mutex> lock(remote_debug_mutex);
++		remote_debug_stopped.store(true);
++		remote_debug_cv.notify_all();
++	}
++
++	for (;;) {
++		std::string request;
++		{
++			std::unique_lock<std::mutex> lock(remote_debug_mutex);
++			remote_debug_cv.wait(lock, [] { return remote_debug_request_pending; });
++			request = remote_debug_request;
++		}
++
++		bool resume = false;
++		const std::string response = RemoteExecuteCommand(request, resume);
++		{
++			std::lock_guard<std::mutex> lock(remote_debug_mutex);
++			remote_debug_response = response;
++			remote_debug_request_pending = false;
++			remote_debug_response_ready = true;
++			remote_debug_cv.notify_all();
++		}
++		if (resume) return 0;
++	}
++}
++
++bool DEBUG_RemoteCommand(const char *command, char *response,
++                         unsigned int response_size,
++                         unsigned int timeout_ms)
++{
++	if (!command || !response || response_size < 2) return false;
++	const std::string request(command);
++	std::istringstream input(request);
++	std::string verb;
++	input >> verb;
++	for (auto &ch : verb) ch = static_cast<char>(toupper(ch));
++	const auto timeout = std::chrono::milliseconds(timeout_ms ? timeout_ms : 5000);
++	std::unique_lock<std::mutex> lock(remote_debug_mutex);
++
++	if (verb == "STATUS") {
++		remote_debug_response = remote_debug_stopped.load() ?
++		                        RemoteRegisterState() : "OK STOPPED=0 REASON=RUNNING";
++	} else if (verb == "PAUSE") {
++		remote_debug_enabled.store(true);
++		if (!remote_debug_stopped.load()) {
++			remote_debug_stop_reason.store(REMOTE_STOP_PAUSE);
++			remote_pause_requested.store(true);
++			if (!remote_debug_cv.wait_for(lock, timeout, [] {
++				return remote_debug_stopped.load();
++			})) {
++				remote_debug_response = "ERR PAUSE_TIMEOUT";
++				goto copy_response;
++			}
++		}
++		remote_debug_response = RemoteRegisterState();
++	} else if (verb == "WAIT") {
++		if (!remote_debug_cv.wait_for(lock, timeout, [] {
++			return remote_debug_stopped.load();
++		})) {
++			remote_debug_response = "ERR WAIT_TIMEOUT";
++			goto copy_response;
++		}
++		remote_debug_response = RemoteRegisterState();
++	} else {
++		if (!remote_debug_stopped.load()) {
++			remote_debug_response = "ERR NOT_STOPPED";
++			goto copy_response;
++		}
++		if (!remote_debug_cv.wait_for(lock, timeout, [] {
++			return !remote_debug_request_pending;
++		})) {
++			remote_debug_response = "ERR BUSY";
++			goto copy_response;
++		}
++		remote_debug_request = request;
++		remote_debug_response_ready = false;
++		remote_debug_request_pending = true;
++		remote_debug_cv.notify_all();
++		if (!remote_debug_cv.wait_for(lock, timeout, [] {
++			return remote_debug_response_ready;
++		})) {
++			remote_debug_response = "ERR COMMAND_TIMEOUT";
++			goto copy_response;
++		}
++	}
++
++copy_response:
++	snprintf(response, response_size, "%s\n", remote_debug_response.c_str());
++	return remote_debug_response.compare(0, 3, "ERR") != 0;
++}
++
+ uint32_t DEBUG_CheckKeys(void) {
+ 	Bits ret=0;
+ 	bool numberrun = false;
+@@ -5580,6 +6580,12 @@ Bitu DEBUG_EnableDebugger(void)
+ {
+ 	exitLoop = true;
+ 
++	if (remote_debug_enabled.load()) {
++		CPU_CycleLeft += CPU_Cycles;
++		CPU_Cycles = 0;
++		return RemoteDebuggerLoop();
++	}
++
+ 	if (!debugging || (debugging && debug_running))
+ 		DEBUG_Enable_Handler(true);
+ 
+@@ -6006,6 +7012,14 @@ void DEBUG_HeavyWriteLogInstruction(void) {
+ }
+ 
+ bool DEBUG_HeavyIsBreakpoint(void) {
++	if (remote_exception_pending.exchange(false)) {
++		remote_debug_enabled.store(true);
++		return true;
++	}
++	if (remote_pause_requested.exchange(false)) {
++		remote_debug_enabled.store(true);
++		return true;
++	}
+ 	if (cpuLog) {
+ 		if (cpuLogCounter>0) {
+ 			LogInstruction(SegValue(cs),reg_eip,cpuLogFile);
+@@ -6037,8 +7051,36 @@ bool DEBUG_HeavyIsBreakpoint(void) {
+ 		return false;
+ 	}
+ 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
++		if (remote_debug_enabled.load())
++			remote_debug_stop_reason.store(REMOTE_STOP_BREAKPOINT);
+ 		return true;
+ 	}
++	/* Dynamic cores do not call DEBUG_IntBreakpoint for software INT opcodes.
++	 * Inspect the instruction boundary here so remote interrupt stops work with
++	 * every configured core and remain positioned before the interrupt. */
++	if (!inhibit_int_breakpoint && !CBreakpoint::BPoints.empty()) {
++		const uint64_t address = GetAddress(SegValue(cs), reg_eip);
++		uint8_t opcode = 0;
++		uint8_t vector = 0;
++		bool is_interrupt = false;
++		if (address != mem_no_address &&
++		    !mem_readb_checked(static_cast<PhysPt>(address), &opcode)) {
++			if (opcode == 0xcc) {
++				vector = 3;
++				is_interrupt = true;
++			} else if (opcode == 0xcd &&
++			           !mem_readb_checked(static_cast<PhysPt>(address + 1), &vector)) {
++				is_interrupt = true;
++			}
++		}
++		if (is_interrupt &&
++		    CBreakpoint::CheckIntBreakpoint(static_cast<PhysPt>(address), vector,
++		                                     reg_ah, reg_al)) {
++			if (remote_debug_enabled.load())
++				remote_debug_stop_reason.store(REMOTE_STOP_INTERRUPT);
++			return true;
++		}
++	}
+ 	return false;
+ }
+ 
+@@ -6056,5 +7098,3 @@ void DEBUG_StopLog(void) {
+ 
+ 
+ #endif // DEBUG
+-
+-
