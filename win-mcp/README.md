@@ -345,8 +345,8 @@ All parameters are hex. Common messages:
 
 | Command | Response | Description |
 |---|---|---|
-| `DIALOG LIST <hwnd>` | `OK 1:Button:OK 2:Button:Cancel ...` | List controls (id:class:text) |
-| `DIALOG GET <hwnd> <id>` | `OK <text>` | GetDlgItemText |
+| `DIALOG LIST <hwnd>` | `OK 1:Button:OK 2:Button:Cancel ...` | List controls (id:class:text); fails if class-name inspection fails or the aggregate response would overflow |
+| `DIALOG GET <hwnd> <id>` | `OK <text>` | Resolve the control handle and read text into the bounded response buffer |
 | `DIALOG SET <hwnd> <id> <text>` | `OK` | SetDlgItemText |
 | `DIALOG TYPE <hwnd> <id> <text>` | `OK` | Type through WM_CHAR into a control selected by dialog ID |
 | `DIALOG CLICK <hwnd> <id>` | `OK` | Click button via BM_CLICK |
@@ -474,7 +474,7 @@ Playwright-style locator that finds child windows by class and/or text.
 
 | Command | Response | Description |
 |---|---|---|
-| `CONTROL FIND <hwnd> <class> <text>` | `OK <child_hwnd>` | Find first matching child |
+| `CONTROL FIND <hwnd> <class> <text>` | `OK <child_hwnd>` | Find first matching child; fails if class inspection fails |
 | `CONTROL FINDID <hwnd> <id>` | `OK <child_hwnd>` | Resolve one unique direct child ID without reading its text |
 
 Use `*` as wildcard for class or text.
@@ -544,6 +544,14 @@ Commands that poll with an internal message pump, keeping Windows responsive.
 |---|---|---|
 | `WAITFOR <hwnd> <id> <text> [ms]` | `OK MATCH` or `OK MISMATCH:<actual>` | Poll until text matches |
 | `EXPECT <hwnd> <id> <text>` | `OK MATCH` or `OK MISMATCH:<actual>` | Immediate text check |
+
+`DIALOG GET`, `WAITFOR`, and `EXPECT` resolve the child handle first and return
+`ERR NOT_FOUND` when it is absent. A zero `WAITFOR` timeout still performs one
+immediate read. Text fields are bounded by the command buffers and may be
+truncated individually. `DIALOG LIST` returns `ERR CONTROL_INSPECTION` on a
+class-name inspection failure and `ERR RESPONSE_TOO_LONG` when the aggregate
+response would overflow. `CONTROL FIND` likewise reports
+`ERR CONTROL_INSPECTION` instead of treating a failed class read as a match.
 
 `CONTROL FINDID` resolves one unique direct child by numeric dialog ID,
 including an Edit control with password styling. Duplicate IDs fail as

@@ -1679,19 +1679,26 @@ static void cmd_clip(const char *arg) {
 /* Callback for EnumChildWindows to list dialog controls */
 static char *dl_ptr;
 static int   dl_remain;
+static BOOL  dl_inspection_failed;
+static BOOL  dl_truncated;
 
 static BOOL FAR PASCAL EnumDlgProc(HWND hwnd, LPARAM lParam) {
     char cls[64], text[128];
     int id, n;
     (void)lParam;
     id = GetDlgCtrlID(hwnd);
-    GetClassName(hwnd, cls, sizeof(cls));
+    if (!GetClassName(hwnd, cls, sizeof(cls))) {
+        dl_inspection_failed = TRUE;
+        return FALSE;
+    }
     GetWindowText(hwnd, text, sizeof(text));
     n = wsprintf(tmp_buf, " %d:%s:%s", id, (LPSTR)cls, (LPSTR)text);
     if (n < dl_remain) {
         lstrcat(dl_ptr, tmp_buf);
         dl_ptr += n;
         dl_remain -= n;
+    } else {
+        dl_truncated = TRUE;
     }
     return TRUE;
 }
@@ -1707,17 +1714,30 @@ static void cmd_dialog(const char *arg) {
         lstrcpy(resp_buf, "OK");
         dl_ptr = resp_buf + 2;
         dl_remain = sizeof(resp_buf) - 4;
+        dl_inspection_failed = FALSE;
+        dl_truncated = FALSE;
         EnumChildWindows(hwnd, (WNDENUMPROC)EnumDlgProc, 0L);
+        if (dl_inspection_failed) {
+            write_response("ERR CONTROL_INSPECTION");
+            return;
+        }
+        if (dl_truncated) {
+            write_response("ERR RESPONSE_TOO_LONG");
+            return;
+        }
         write_response(resp_buf);
 
     } else if (prefix(arg, "GET ")) {
         int id;
+        HWND ctrl;
         char text[256];
         p = after(arg, 4);
         hwnd = (HWND)parse_hex(&p);
         p = skip_sp(p); id = parse_dec(&p);
         if (!IsWindow(hwnd)) { write_response("ERR INVALID_HWND"); return; }
-        GetDlgItemText(hwnd, id, text, sizeof(text));
+        ctrl = GetDlgItem(hwnd, id);
+        if (!ctrl) { write_response("ERR NOT_FOUND"); return; }
+        GetWindowText(ctrl, text, sizeof(text));
         wsprintf(resp_buf, "OK %s", (LPSTR)text);
         write_response(resp_buf);
 
@@ -2254,20 +2274,24 @@ static void cmd_scroll(const char *arg) {
 static char  cf_class[64];
 static char  cf_text[128];
 static HWND  cf_found;
+static BOOL  cf_inspection_failed;
 
 static BOOL FAR PASCAL EnumCtrlFindProc(HWND hwnd, LPARAM lParam) {
     char cls[64], text[128];
+    char u_text[128], u_pattern[128];
+    int ti, pi;
     (void)lParam;
-    GetClassName(hwnd, cls, sizeof(cls));
-    GetWindowText(hwnd, text, sizeof(text));
+    if (!GetClassName(hwnd, cls, sizeof(cls))) {
+        cf_inspection_failed = TRUE;
+        return FALSE;
+    }
 
     /* Match class if specified (case-insensitive) */
     if (cf_class[0] && !prefix(cls, cf_class)) return TRUE;
     /* Match text if specified (case-insensitive substring) */
     if (cf_text[0]) {
+        GetWindowText(hwnd, text, sizeof(text));
         /* Simple case-insensitive substring: convert both to upper */
-        char u_text[128], u_pattern[128];
-        int ti, pi;
         for (ti = 0; text[ti] && ti < 127; ti++) {
             u_text[ti] = text[ti];
             if (u_text[ti] >= 'a' && u_text[ti] <= 'z') u_text[ti] -= 32;
@@ -2372,9 +2396,12 @@ static void cmd_control(const char *arg) {
         if (cf_text[0] == '*' && !cf_text[1]) cf_text[0] = '\0';
 
         cf_found = NULL;
+        cf_inspection_failed = FALSE;
         EnumChildWindows(hwnd, (WNDENUMPROC)EnumCtrlFindProc, 0L);
 
-        if (cf_found)
+        if (cf_inspection_failed)
+            lstrcpy(resp_buf, "ERR CONTROL_INSPECTION");
+        else if (cf_found)
             wsprintf(resp_buf, "OK %04X", (UINT)cf_found);
         else
             lstrcpy(resp_buf, "ERR NOT_FOUND");
@@ -2581,6 +2608,7 @@ static void cmd_waitfor(const char *arg) {
     /* WAITFOR <hwnd> <id> <text> [ms] */
     const char *p;
     HWND hwnd;
+    HWND ctrl;
     int id;
     char text[256], actual[256];
     DWORD timeout_ms, start;
@@ -2588,21 +2616,25 @@ static void cmd_waitfor(const char *arg) {
     p = skip_sp(arg);
     hwnd = (HWND)parse_hex(&p);
     p = skip_sp(p); id = parse_dec(&p);
+    if (!IsWindow(hwnd)) { write_response("ERR INVALID_HWND"); return; }
+    ctrl = GetDlgItem(hwnd, id);
+    if (!ctrl) { write_response("ERR NOT_FOUND"); return; }
     p = next_word(p, text, sizeof(text));
     p = skip_sp(p);
     timeout_ms = (*p) ? (DWORD)parse_dec(&p) : 10000UL;
-    if (!IsWindow(hwnd)) { write_response("ERR INVALID_HWND"); return; }
     if (!text[0]) { write_response("ERR SYNTAX"); return; }
 
     start = GetTickCount();
-    while (GetTickCount() - start < timeout_ms) {
-        GetDlgItemText(hwnd, id, actual, sizeof(actual));
+    do {
+        ctrl = GetDlgItem(hwnd, id);
+        if (!ctrl) { write_response("ERR NOT_FOUND"); return; }
+        GetWindowText(ctrl, actual, sizeof(actual));
         if (lstrcmpi(actual, text) == 0) {
             write_response("OK MATCH");
             return;
         }
         pump_messages();
-    }
+    } while (GetTickCount() - start < timeout_ms);
     wsprintf(resp_buf, "OK MISMATCH:%s", (LPSTR)actual);
     write_response(resp_buf);
 }
@@ -2615,17 +2647,20 @@ static void cmd_expect(const char *arg) {
     /* EXPECT <hwnd> <id> <text> */
     const char *p;
     HWND hwnd;
+    HWND ctrl;
     int id;
     char text[256], actual[256];
 
     p = skip_sp(arg);
     hwnd = (HWND)parse_hex(&p);
     p = skip_sp(p); id = parse_dec(&p);
+    if (!IsWindow(hwnd)) { write_response("ERR INVALID_HWND"); return; }
+    ctrl = GetDlgItem(hwnd, id);
+    if (!ctrl) { write_response("ERR NOT_FOUND"); return; }
     p = skip_sp(p);
     lstrcpyn(text, p, sizeof(text));
-    if (!IsWindow(hwnd)) { write_response("ERR INVALID_HWND"); return; }
 
-    GetDlgItemText(hwnd, id, actual, sizeof(actual));
+    GetWindowText(ctrl, actual, sizeof(actual));
     if (lstrcmpi(actual, text) == 0) {
         write_response("OK MATCH");
     } else {
