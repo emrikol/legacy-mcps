@@ -14,12 +14,12 @@ Two small programs that run inside vintage operating systems and expose their AP
 
 Both use the same protocol: the host writes a command to a text file, the agent reads it, executes it, and writes a response to another text file. No network stack, no sockets, no shared memory — just files. This works because the "files" live on a shared drive (SMB mount, DOSBox-X host directory mount, or emu2 drive mapping).
 
-Generic host clients are included for both mailboxes. `bin/winmcp.js` exposes
-the Playwright-like WinAuto controller, task/module inspection, structured
-segment and memory results, literal command sequences, recording, and
-playback. `bin/dosmcp.js` provides a serialized DOSMCP command client. Both
-verify the live agent's reported source-contract identity against this checkout
-before normal command sessions. This compatibility check is not
+The primary Windows host API is `lib/win-auto.js`, a Playwright-like controller.
+The MCP agents do not require command-line interfaces. Optional thin adapters
+in `bin/` expose the same library operations to interactive shells and CI;
+they contain no independent automation implementation. Both normal mailbox
+clients verify the live agent's reported source-contract identity against this
+checkout before a command session. This compatibility check is not
 authentication; the explicit post-guest-reset operation does not contact or
 authenticate the guest.
 
@@ -74,7 +74,7 @@ node scripts/test-guest-tool-identities.js
 The receipt identifies reviewed source and build recipes; it is not a claim of
 bit-for-bit reproducibility across compilers or hosts.
 
-### Host client quick start
+### Optional host CLI quick start
 
 ```bash
 node bin/winmcp.js status
@@ -105,6 +105,23 @@ node bin/dosmcp.js reset --confirm-guest-reset
 
 The confirmation does not reset the guest. Reset holds the advisory host lease
 and refuses a pending response or unconsumed request.
+
+Optional diagnostic adapters also expose the checked DOSBox-X debugger,
+deterministic reverse-step workflow, and receipt-backed Win16 memory snapshots:
+
+```bash
+node bin/dosbox-debugger.js status
+node bin/dosbox-debugger.js reset --confirm-emulator-reset  # only after external reset
+node bin/dosbox-reverse.js step clean-checkpoint 1
+node bin/winmcp-snapshot.js capture examples/win-memory-snapshot.json snapshot.json
+node bin/winmcp-snapshot.js diff before.json after.json diff.json
+```
+
+See [DOSBOX-DEBUGGER.md](DOSBOX-DEBUGGER.md) and [SCRIPTING.md](SCRIPTING.md)
+for the exact limits and evidence boundaries. Reverse-step restores a named
+checkpoint and replays forward to an earlier instruction sequence; it is not
+native reverse execution. Memory snapshots are serialized against cooperating
+host clients but explicitly non-atomic because Windows may run between reads.
 
 ### Requirements
 
@@ -237,7 +254,7 @@ It binds to loopback but has no authentication; see [PATCHES.md](PATCHES.md#cont
 The `lib/win-auto.js` library provides a Playwright-style async API for driving win-mcp from Node.js scripts. Use `withWinAutoSession` to hold one cross-process mailbox lease and verify the live build identity across a complete workflow:
 
 ```js
-const { withWinAutoSession } = require('./lib/win-session');
+const { withWinAutoSession } = require('./lib/win-auto');
 
 await withWinAutoSession({ magicDir: './share/_MAGIC_' }, async win => {
   const notepad = await win.exec('NOTEPAD.EXE');
@@ -257,6 +274,13 @@ identity, status, minimize, and debugger commands independently of WINMCP's
 file mailbox. The server listens on loopback but has no authentication; any
 local process that can connect has privileged debugging control.
 
+`WinAuto.dosboxDebug()` and `dosboxDebugBatch()` acquire the checked debugger
+lease and validate its live identity. On that facade, `dosboxCommand()` rejects
+`DEBUG`, and `dosboxDebug()` rejects `MUTATE` and nested `BATCH`; use the audited
+API in [DOSBOX-DEBUGGER.md](DOSBOX-DEBUGGER.md) for mutation. The lower-level
+`DosboxControl` transport and unauthenticated socket remain privileged raw
+interfaces, so a local process can bypass these cooperating-client safeguards.
+
 **Examples:**
 
 - [examples/notepad.js](examples/notepad.js) — open Notepad, type text, read clipboard, capture screenshot
@@ -271,24 +295,32 @@ legacy-mcps/
 ├── README.md              This file
 ├── SCRIPTING.md           win-auto.js API reference
 ├── PATCHES.md             DOSBox-X and emu2 patch documentation
+├── DOSBOX-DEBUGGER.md     Checked debugger client and mutation boundary
 ├── WIN-MCP.md             Original architecture design document
 ├── lib/
 │   ├── win-auto.js        Node.js scripting library (Playwright-style)
-│   ├── win-session.js     Leased, source-identity-verified WinAuto workflow
+│   ├── win-session.js     Internal leased-session implementation for WinAuto
 │   ├── win-sequence.js    Bounded literal WINMCP sequences
 │   ├── dos-mcp.js         Serialized DOSMCP host client
 │   ├── mcp-mailbox.js     Bounded file-mailbox transport
 │   ├── host-command-lease.js Advisory cross-process channel ownership
 │   ├── dosbox-control.js  DOSBox-X control/debugger TCP client
+│   ├── dosbox-debugger.js Serialized, identity-checked debugger session
+│   ├── dosbox-reverse.js  Checked checkpoint-and-forward reverse-step workflow
+│   ├── win-memory-snapshot.js Receipt-backed Win16 snapshots and diffs
 │   └── win-compare.js     BMP screenshot comparison utility
 ├── bin/
-│   ├── winmcp.js          Generic WinAuto/inspection/sequence CLI
-│   └── dosmcp.js          Generic DOSMCP CLI
+│   ├── winmcp.js          Optional WinAuto/inspection/sequence CLI
+│   ├── dosmcp.js          Optional DOSMCP CLI
+│   ├── dosbox-debugger.js Optional checked debugger CLI
+│   ├── dosbox-reverse.js  Optional reverse-step CLI
+│   └── winmcp-snapshot.js Optional Win16 snapshot/diff CLI
 ├── examples/
 │   ├── notepad.js         Demo: type text, read clipboard, screenshot
 │   ├── minesweeper.js     Demo: automate Minesweeper (Win16)
 │   ├── dos-sysinfo.js     Demo: query DOS MCP for system info
-│   └── dosbox-debugger.js Demo: stopped-CPU debugger batch
+│   ├── dosbox-debugger.js Demo: stopped-CPU debugger batch
+│   └── win-memory-snapshot.json Illustrative generic snapshot manifest
 ├── dos-mcp/               DOS TSR agent
 │   ├── src/dosmcp.asm     Source (8086 NASM assembly)
 │   ├── Makefile            Build + test targets

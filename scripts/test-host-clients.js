@@ -12,10 +12,14 @@ for (const script of [
   'test-mcp-mailbox.js',
   'test-guest-identity-client.js',
   'test-dos-mcp-client.js',
+  'test-dosbox-control.js',
+  'test-dosbox-debugger.js',
+  'test-dosbox-reverse.js',
   'test-win-auto-api.js',
   'test-win-session.js',
   'test-win-sequence.js',
   'test-win-auto-cli.js',
+  'test-win-memory-snapshot.js',
 ]) {
   execFileSync(process.execPath, [path.join(__dirname, script)], {
     cwd: root, stdio: 'inherit', timeout: 30000,

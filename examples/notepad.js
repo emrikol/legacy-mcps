@@ -23,7 +23,7 @@
 
 'use strict';
 
-const { withWinAutoSession } = require('../lib/win-session');
+const { withWinAutoSession } = require('../lib/win-auto');
 const path = require('path');
 
 const magicIdx = process.argv.indexOf('--magic-dir');

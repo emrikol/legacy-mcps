@@ -14,7 +14,9 @@ assert.throws(() => encodeDebugBatch(['CONTINUE']), /forbidden verb/);
 assert.throws(() => encodeDebugBatch(['REGISTERS\nSTEP']), /printable ASCII/);
 assert.throws(() => new DosboxControl({ port: 0 }), /port/);
 assert.throws(() => new DosboxControl({ timeout: 0 }), /timeout/);
+assert.throws(() => new DosboxControl({ timeout: 300001 }), /timeout/);
 assert.throws(() => new DosboxControl({ maxResponseBytes: 0 }), /response size/);
+assert.throws(() => new DosboxControl({ maxResponseBytes: 16777217 }), /response size/);
 assert.throws(() => new DosboxControl({ host: '' }), /host/);
 const build = 'a'.repeat(64);
 assert.equal(validateIdentity(
@@ -56,6 +58,36 @@ async function main() {
     await assert.rejects(() => bounded.status(), /exceeds 2 bytes/);
   } finally {
     await new Promise(resolve => server.close(resolve));
+  }
+
+  const truncated = net.createServer(socket => {
+    socket.resume();
+    socket.on('end', () => socket.end('OK PARTIAL'));
+  });
+  await new Promise((resolve, reject) => {
+    truncated.once('error', reject);
+    truncated.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const client = new DosboxControl({ port: truncated.address().port, timeout: 1000 });
+    await assert.rejects(() => client.status(), /terminal newline/);
+  } finally {
+    await new Promise(resolve => truncated.close(resolve));
+  }
+
+  const multiline = net.createServer(socket => {
+    socket.resume();
+    socket.on('end', () => socket.end('OK SCREEN\nROW ONE\nROW TWO\n'));
+  });
+  await new Promise((resolve, reject) => {
+    multiline.once('error', reject);
+    multiline.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const client = new DosboxControl({ port: multiline.address().port, timeout: 1000 });
+    assert.equal(await client.send('SCREEN'), 'OK SCREEN\nROW ONE\nROW TWO');
+  } finally {
+    await new Promise(resolve => multiline.close(resolve));
   }
   console.log('DOSBox-X control client tests passed');
 }

@@ -23,6 +23,9 @@ A host-side scripting library (`lib/win-auto.js`) provides a Playwright-style as
 | `win-mcp/src/WINMCP.EXE` | Compiled Win16 NE executable |
 | `win-mcp/src/WINMCHK.DLL` | Hook DLL for journal record/playback |
 | `lib/win-auto.js` | Node.js scripting library (Playwright-style API) |
+| `lib/dosbox-debugger.js` | Serialized, identity-checked DOSBox-X debugger session |
+| `lib/dosbox-reverse.js` | Checkpoint-and-forward reverse-step workflow |
+| `lib/win-memory-snapshot.js` | Receipt-backed non-atomic Win16 snapshots and diffs |
 | `share/` | IPC directory — magic files live in `share/_MAGIC_/` |
 | `tools/` | Build tools (Watcom, DOSBox-X, emu2) |
 
@@ -53,8 +56,8 @@ node scripts/test-host-clients.js
 
 This suite exercises mailbox ownership, timeout poisoning, identity parsing,
 DOSMCP transport, the structured WinAuto API, leased sessions, bounded command
-sequences, CLI parsing, and the generic public-source inventory without
-launching a guest.
+sequences, DOSBox control/debugger/reverse workflows, Win16 snapshot receipts,
+CLI parsing, and the generic public-source inventory without launching a guest.
 
 ---
 

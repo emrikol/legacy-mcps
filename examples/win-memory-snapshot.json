@@ -1,0 +1,19 @@
+{
+  "module": "NOTEPAD",
+  "ranges": [
+    {
+      "name": "segment-1-prefix",
+      "segment": 1,
+      "offset": 0,
+      "length": 64,
+      "fields": [
+        {
+          "name": "first-eight-bytes",
+          "offset": 0,
+          "type": "bytes",
+          "length": 8
+        }
+      ]
+    }
+  ]
+}

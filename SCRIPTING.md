@@ -5,7 +5,7 @@ A Node.js library for automating Windows 3.x applications running inside DOSBox-
 ## Quick Start
 
 ```js
-const { withWinAutoSession } = require('./lib/win-session');
+const { withWinAutoSession } = require('./lib/win-auto');
 
 await withWinAutoSession({ magicDir: './share/_MAGIC_' }, async win => {
   // Launch Notepad, type text, select all, copy to clipboard
@@ -47,10 +47,12 @@ advisory cross-process lease, waits for the exact `READY` marker, verifies
 lease after the callback. The lease serializes only clients that honor it; it
 is not authentication and it does not make several guest commands atomic.
 
-## Generic host CLI
+## Optional host CLI adapter
 
-`bin/winmcp.js` exposes the same controller without application-specific
-defaults:
+The MCP and `WinAuto` library do not require a CLI. `bin/winmcp.js` is a thin
+argument parser for interactive debugging, shell scripts, and CI; it exposes
+the same controller without application-specific defaults and contains no
+second automation implementation:
 
 ```bash
 node bin/winmcp.js status
@@ -92,7 +94,8 @@ serially under one host lease and fail on the first `ERR` by default.
 iteration. A sequence is not a guest transaction: Windows may run between
 mailbox commands.
 
-`bin/dosmcp.js` uses the same bounded transport and source-identity preflight:
+The equally optional `bin/dosmcp.js` uses the same bounded transport and
+source-identity preflight:
 
 ```bash
 node bin/dosmcp.js identity
@@ -539,6 +542,27 @@ await win.dosboxKey('ENTER');
 await win.dosboxScreenshot();
 ```
 
+On `WinAuto`, `dosboxCommand()` rejects raw `DEBUG` requests.
+`dosboxDebug()` and `dosboxDebugBatch()` run through an identity-checked,
+serialized `DebuggerSession`; they reject mutation and nested batch escape
+routes. Use the explicitly confirmed and durably audited mutation API in
+[DOSBOX-DEBUGGER.md](DOSBOX-DEBUGGER.md) when changing emulator state. The
+lower-level `DosboxControl` class and the unauthenticated TCP socket are raw,
+privileged interfaces; these safeguards serialize cooperating clients rather
+than enforcing a security boundary against another local process.
+
+The checked session serializes same-session commands and stops its queue after
+a transport rejection. Its host timeout is never shorter than the server's
+30-second debugger ceiling plus five seconds; `WAIT N` requires `N+5000ms` and
+accepts at most 295 seconds. A broken TCP exchange still leaves the command's
+effect uncertain. The checked client retains
+`.dosbox-debugger-host-command.inflight` across transport failure, malformed
+responses, `ERR PAUSE_TIMEOUT`, `ERR COMMAND_TIMEOUT`, and `ERR BUSY`, blocking
+later checked sessions. After externally resetting or replacing the disposable
+emulator, use `node bin/dosbox-debugger.js reset --confirm-emulator-reset` to
+clear only that retained host marker. The command does not reset the emulator
+or restore pristine evidence.
+
 ### Remote debugger
 
 Pause before collecting related state and always arrange to continue in a
@@ -584,6 +608,55 @@ with the capability identity. Check `IDENTITY` before depending on a command.
 See [examples/dosbox-debugger.js](examples/dosbox-debugger.js) for a complete
 read-only snapshot.
 
+### Deterministic reverse-step
+
+The optional reverse adapter restores a named checkpoint, arms recorded
+determinism and input replay, and steps forward under the same debugger lease
+to the exact earlier instruction sequence:
+
+```bash
+node bin/dosbox-reverse.js step CHECKPOINT COUNT
+```
+
+Place optional `--host`, `--port`, `--timeout`, `--max-response-bytes`,
+`--lease-dir`, `--lease-timeout`, and `--poll-ms` settings before `step`.
+
+Each `STEP` request is capped at 10,000 instructions and a workflow is capped
+at 10,000 requests. Completion requires exact sequence receipts,
+`MODE=VERIFY`, `FAILED=0`, `ACTIVE=1`, and `SKIPPED=0`. The operation is
+reverse-step only. It is not native backward execution, and there is no
+reverse-continue because `RUN UNTIL` cannot enforce a maximum sequence before
+an address is reached again.
+
+The library entry is `runReverse()` from `lib/dosbox-reverse.js`; pass it the
+facade supplied by `withDebuggerSession()` so one lease spans restore, replay,
+stepping, and validation.
+
+### Receipt-backed Win16 memory snapshots
+
+`lib/win-memory-snapshot.js` captures declared module ranges through the main
+`lib/win-auto.js` session API. It resolves the current segment selectors,
+splits reads into at most 512 bytes, records exact commands/responses and task
+state before and after, hashes each range, and can decode explicitly declared
+integer, byte, or ASCII fields.
+
+```bash
+node bin/winmcp-snapshot.js capture examples/win-memory-snapshot.json before.json
+node bin/winmcp-snapshot.js capture examples/win-memory-snapshot.json after.json
+node bin/winmcp-snapshot.js diff before.json after.json changes.json
+```
+
+Outputs use the `legacy-mcps.win16-memory-snapshot/v1` and
+`legacy-mcps.win16-memory-diff/v1` schemas and are durably published without
+replacing an existing path. If a check fails after the destination link becomes
+visible, the API reports `publicationDisposition=retained-uncertain` and leaves
+that path in place; it will not risk unlinking a path that another process could
+have replaced. Inspect or remove that retained output explicitly before retrying.
+Snapshot evidence always declares `atomic:false`: the host lease
+prevents cooperating clients from interleaving mailbox commands, but Windows
+and the inspected application may run between reads. Matching task receipts
+do not prove that selectors or application state stayed unchanged.
+
 ### Evidence and safety limits
 
 The endpoint binds to `127.0.0.1`, but it is deliberately unauthenticated. Any
@@ -592,9 +665,11 @@ execution and input, capture screens, shut down the emulator, or invoke unsafe
 mutation. Never forward or proxy the socket. Use an isolated host/session when
 other local processes are not trusted.
 
-Inspection is read-only; mutation is not. After successful `MUTATE`, regard the
-entire emulator session as manipulated evidence even if later bytes happen to
-match their earlier values. `SNAPSHOT` requires a stopped CPU and captures a
+Read-only inspection does not intentionally change guest bytes, while stop,
+trace, replay, and coverage commands do change debugger state. `MUTATE` changes
+CPU or memory state. After a mutation attempt, regard the entire emulator
+session as manipulated evidence even if verification fails or later bytes
+happen to match their earlier values. `SNAPSHOT` requires a stopped CPU and captures a
 bounded rendered image, but is not an atomic snapshot of every device. Replay
 verification checks recorded clocks, DOS reads/offsets, IRQs, NMIs, checkpoint,
 and sequenced input; it does not establish universal emulator determinism.

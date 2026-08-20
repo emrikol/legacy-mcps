@@ -11,6 +11,9 @@ and application media are not included.
   inspection. Identity verification checks compatibility; it does not
   authenticate the guest or share.
 - `dosbox-debugger.js` demonstrates a stopped-CPU debugger batch.
+- `win-memory-snapshot.json` is an illustrative, generic NOTEPAD segment-range
+  manifest for `bin/winmcp-snapshot.js`; loaded segment layouts are runtime
+  facts, so treat captures as diagnostic and non-atomic.
 - `win-sequences/health-check.json` is a bounded literal WINMCP sequence for
   `bin/winmcp.js sequence`.
 

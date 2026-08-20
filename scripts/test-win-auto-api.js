@@ -7,7 +7,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { expectedRuntimeIdentity } = require('../lib/guest-tool-identity');
-const { WinAuto, Window } = require('../lib/win-auto');
+const { resetWinAutoSession, WinAuto, Window, withWinAutoSession } = require('../lib/win-auto');
 
 class FakeMailbox {
   constructor(responses) { this.responses = [...responses]; this.commands = []; }
@@ -19,8 +19,35 @@ class FakeMailbox {
 }
 
 async function main() {
+  assert.equal(typeof withWinAutoSession, 'function');
+  assert.equal(typeof resetWinAutoSession, 'function');
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'legacy-mcps-win-auto-'));
   try {
+    const rawAuto = new WinAuto({ magicDir: root });
+    await assert.rejects(() => rawAuto.dosboxCommand(
+      'DEBUG MUTATE REGISTER AX 1 CONFIRM_MANIPULATED_ORACLE'), /leased debugger access/);
+    await assert.rejects(() => rawAuto.dosboxDebug(
+      'mutate register ax 1 confirm_manipulated_oracle'), /audited debugger mutation/);
+    await assert.rejects(() => rawAuto.dosboxDebug('BATCH 1 9:REGISTERS'), /framed batch API/);
+    const debuggerLock = path.join(root, '.dosbox-debugger-host-command.lock');
+    const debugControl = {
+      identity: async () => 'IDENTITY',
+      debug: async command => {
+        assert.equal(fs.existsSync(debuggerLock), true);
+        return `OK ${command}`;
+      },
+      debugBatch: async commands => {
+        assert.equal(fs.existsSync(debuggerLock), true);
+        return `OK BATCH N=${commands.length} 2:OK`;
+      },
+    };
+    const debuggerOptions = { control: debugControl,
+      identityValidator: () => Object.freeze({ build: 'a'.repeat(64) }) };
+    assert.equal(await rawAuto.dosboxDebug('STATUS', debuggerOptions), 'OK STATUS');
+    assert.equal(fs.existsSync(debuggerLock), false);
+    assert.equal(await rawAuto.dosboxDebugBatch(['REGISTERS'], debuggerOptions),
+      'OK BATCH N=1 2:OK');
+    assert.equal(fs.existsSync(debuggerLock), false);
     const expected = expectedRuntimeIdentity('WINMCP');
     const features = ['META', 'WINDOW', 'TASK', 'MODULE', 'MEMORY', 'CONTROL',
       'RECORD', 'PLAY', 'CONTROL_FINDID'];
@@ -51,6 +78,8 @@ async function main() {
       { confirmUnsafe: true });
     assert.equal(mutation.before.toString('hex'), 'aabb');
     assert.equal(win.manipulated, true);
+    assert.throws(() => { win.manipulated = false; }, /getter|read only|Cannot set/);
+    assert.equal(win.manipulated, true, 'manipulated state must be monotonic');
     const child = await new Window(win, '1111').locatorById(42);
     assert.equal(child.hwnd, '4321');
     await win.waitForPlayback({ timeout: 1000, pollMs: 1 });
